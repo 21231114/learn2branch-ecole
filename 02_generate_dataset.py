@@ -612,6 +612,12 @@ if __name__ == '__main__':
         instances_valid = glob.glob('data/instances/setcover/valid_500r_1000c_0.05d/*.lp')
         instances_test = glob.glob('data/instances/setcover/test_500r_1000c_0.05d/*.lp')
         out_dir = 'data/samples/setcover/500r_1000c_0.05d'
+        # transfer sets: generalization test sets with different row counts
+        transfer_configs = [
+            ('data/instances/setcover/transfer_500r_1000c_0.05d',  'data/samples/setcover/500r_1000c_0.05d/transfer'),
+            ('data/instances/setcover/transfer_1000r_1000c_0.05d', 'data/samples/setcover/1000r_1000c_0.05d/transfer'),
+            ('data/instances/setcover/transfer_2000r_1000c_0.05d', 'data/samples/setcover/2000r_1000c_0.05d/transfer'),
+        ]
 
     elif args.problem == 'cauctions':
         instances_train = glob.glob('data/instances/cauctions/train_100_500/*.lp')
@@ -652,6 +658,9 @@ if __name__ == '__main__':
     else:
         raise NotImplementedError
 
+    if 'transfer_configs' not in dir():
+        transfer_configs = []
+
     print(f"{len(instances_train)} train instances")
     print(f"{len(instances_valid)} validation instances")
     print(f"{len(instances_test)} test instances")
@@ -674,6 +683,13 @@ if __name__ == '__main__':
             collect_samples(instances_test, out_dir + '/test', rng, args.njobs,
                             time_limit=time_limit)
 
+        for i, (inst_dir, transfer_out_dir) in enumerate(transfer_configs):
+            instances_transfer = glob.glob(f'{inst_dir}/*.lp')
+            if instances_transfer:
+                rng = np.random.RandomState(args.seed + 3 + i)
+                collect_samples(instances_transfer, transfer_out_dir, rng,
+                                args.njobs, time_limit=time_limit)
+
     elif args.solver == 'gurobi':
         # ── Gurobi-based generation ──
         print(f"Gurobi settings: time_limit={args.time_limit}s")
@@ -691,3 +707,10 @@ if __name__ == '__main__':
             rng = np.random.RandomState(args.seed + 2)
             collect_samples_gurobi(instances_test, out_dir + '/test', rng,
                                    args.njobs, args.time_limit)
+
+        for i, (inst_dir, transfer_out_dir) in enumerate(transfer_configs):
+            instances_transfer = glob.glob(f'{inst_dir}/*.lp')
+            if instances_transfer:
+                rng = np.random.RandomState(args.seed + 3 + i)
+                collect_samples_gurobi(instances_transfer, transfer_out_dir, rng,
+                                       args.njobs, args.time_limit)
