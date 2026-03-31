@@ -1,0 +1,5 @@
+__pycache__/*
+.claude/*
+data/*
+trained_models/*
+.vscode/*

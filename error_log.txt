@@ -1,0 +1,42 @@
+[gurobi] Error in episode 3, instance data/instances/setcover/train_500r_1000c_0.05d/instance_1864.lp, seed 3998999672
+Traceback (most recent call last):
+  File "02_generate_dataset.py", line 364, in make_samples_gurobi
+    node_observation = observation["node_observation"]
+TypeError: 'NoneType' object is not subscriptable
+
+[gurobi] Error in episode 4, instance data/instances/setcover/train_500r_1000c_0.05d/instance_2076.lp, seed 1678418526
+Traceback (most recent call last):
+  File "02_generate_dataset.py", line 364, in make_samples_gurobi
+    node_observation = observation["node_observation"]
+TypeError: 'NoneType' object is not subscriptable
+
+[gurobi] Error in episode 7, instance data/instances/setcover/train_500r_1000c_0.05d/instance_3995.lp, seed 2122579412
+Traceback (most recent call last):
+  File "02_generate_dataset.py", line 364, in make_samples_gurobi
+    node_observation = observation["node_observation"]
+TypeError: 'NoneType' object is not subscriptable
+
+[gurobi] Error in episode 12, instance data/instances/setcover/train_500r_1000c_0.05d/instance_5364.lp, seed 2988243274
+Traceback (most recent call last):
+  File "02_generate_dataset.py", line 364, in make_samples_gurobi
+    node_observation = observation["node_observation"]
+TypeError: 'NoneType' object is not subscriptable
+
+[gurobi] Error in episode 1112, instance data/instances/setcover/valid_500r_1000c_0.05d/instance_1671.lp, seed 1615123612
+Traceback (most recent call last):
+  File "02_generate_dataset.py", line 364, in make_samples_gurobi
+    node_observation = observation["node_observation"]
+TypeError: 'NoneType' object is not subscriptable
+
+[gurobi] Error in episode 971, instance data/instances/setcover/test_500r_1000c_0.05d/instance_972.lp, seed 2423132936
+Traceback (most recent call last):
+  File "02_generate_dataset.py", line 364, in make_samples_gurobi
+    node_observation = observation["node_observation"]
+TypeError: 'NoneType' object is not subscriptable
+
+[gurobi] Error in episode 1191, instance data/instances/setcover/test_500r_1000c_0.05d/instance_1192.lp, seed 618102001
+Traceback (most recent call last):
+  File "02_generate_dataset.py", line 364, in make_samples_gurobi
+    node_observation = observation["node_observation"]
+TypeError: 'NoneType' object is not subscriptable
+
