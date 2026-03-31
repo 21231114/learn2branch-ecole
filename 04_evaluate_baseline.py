@@ -1,0 +1,306 @@
+"""
+04_evaluate_baseline.py — Gurobi-only baseline evaluation.
+
+Runs pure Gurobi (no model fixings) on test instances and records results
+to a CSV file.  Summary metrics are also appended to the model's train_log.txt
+so the baseline result is co-located with training history.
+
+Usage:
+    python 04_evaluate_baseline.py setcover -g -1
+    python 04_evaluate_baseline.py setcover -g -1 --time-limit 300
+    python 04_evaluate_baseline.py setcover -g -1 --solver scip
+"""
+
+import os
+import sys
+import argparse
+import pathlib
+import time
+import csv
+import gzip
+import pickle
+import re
+import json
+import numpy as np
+
+from utilities import log
+
+
+# ======================================================================
+# Solver helpers (mirrors solver_handoff but without model dependency)
+# ======================================================================
+
+def solve_gurobi(instance_path, time_limit, verbose=False):
+    import gurobipy as gp
+    from gurobipy import GRB
+
+    env = gp.Env(empty=True)
+    env.setParam('OutputFlag', 1 if verbose else 0)
+    env.start()
+    model = gp.read(instance_path, env)
+    model.setParam('TimeLimit', time_limit)
+    model.setParam('Threads', 1)
+    model.optimize()
+
+    status_map = {
+        GRB.OPTIMAL:   'optimal',
+        GRB.INFEASIBLE: 'infeasible',
+        GRB.INF_OR_UNBD: 'infeasible',
+        GRB.UNBOUNDED: 'unbounded',
+        GRB.TIME_LIMIT: 'timelimit',
+    }
+    status = status_map.get(model.Status, str(model.Status))
+
+    info = {
+        'solving_time': model.Runtime,
+        'n_nodes': int(model.NodeCount) if hasattr(model, 'NodeCount') else 0,
+    }
+
+    if model.SolCount > 0:
+        obj_val = model.ObjVal
+        try:
+            info['mip_gap'] = model.MIPGap
+        except Exception:
+            info['mip_gap'] = 0.0
+        info['feasible'] = True
+        try:
+            info['max_violation'] = model.MaxVio
+        except Exception:
+            info['max_violation'] = 0.0
+        if status == 'timelimit':
+            status = 'timelimit*'
+        return status, obj_val, info
+    else:
+        info['mip_gap'] = None
+        info['feasible'] = False
+        info['max_violation'] = None
+        return status, None, info
+
+
+def solve_scip(instance_path, time_limit, verbose=False):
+    from pyscipopt import Model
+
+    model = Model()
+    model.setParam('display/verblevel', 4 if verbose else 0)
+    model.setParam('limits/time', time_limit)
+    model.readProblem(instance_path)
+    model.optimize()
+
+    scip_status = model.getStatus()
+    status_map = {
+        'optimal':    'optimal',
+        'infeasible': 'infeasible',
+        'unbounded':  'unbounded',
+        'timelimit':  'timelimit',
+    }
+    status = status_map.get(scip_status, scip_status)
+
+    info = {
+        'solving_time': model.getSolvingTime(),
+        'n_nodes': model.getNNodes(),
+    }
+
+    if model.getNSols() > 0:
+        best_sol = model.getBestSol()
+        obj_val = model.getSolObjVal(best_sol)
+        if status == 'timelimit':
+            status = 'timelimit*'
+        info['feasible'] = True
+        info['mip_gap'] = None
+        info['max_violation'] = None
+        return status, obj_val, info
+    else:
+        info['feasible'] = False
+        info['mip_gap'] = None
+        info['max_violation'] = None
+        return status, None, info
+
+
+def solve_instance(instance_path, solver_name, time_limit, verbose=False):
+    if solver_name == 'gurobi':
+        return solve_gurobi(instance_path, time_limit, verbose)
+    elif solver_name == 'scip':
+        return solve_scip(instance_path, time_limit, verbose)
+    else:
+        raise ValueError(f"Unknown solver: {solver_name}")
+
+
+# ======================================================================
+# Main evaluation
+# ======================================================================
+
+def evaluate_baseline(data_dir, solver_name, time_limit, verbose, logfile):
+    def _numeric_key(path):
+        nums = re.findall(r'\d+', os.path.basename(path))
+        return int(nums[-1]) if nums else 0
+
+    test_files = sorted(
+        (str(f) for f in data_dir.glob('sample_*.pkl')),
+        key=_numeric_key,
+    )
+    if not test_files:
+        log(f"No test files found in {data_dir}", logfile)
+        return
+
+    log(f"{'='*60}", logfile)
+    log(f"Baseline Evaluation — {len(test_files)} samples", logfile)
+    log(f"Solver: {solver_name}, Time limit: {time_limit}s", logfile)
+    log(f"{'='*60}", logfile)
+
+    results_csv = str(data_dir.parent / f'baseline_results_{solver_name}.csv')
+    fieldnames = [
+        'sample', 'instance', 'n_vars',
+        'obj_baseline', 'time_baseline',
+        'status_baseline', 'mip_gap', 'feasible', 'max_violation',
+    ]
+
+    times, objs, statuses = [], [], []
+    n_skipped = 0
+
+    with open(results_csv, 'w', newline='') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for i, test_file in enumerate(test_files):
+            with gzip.open(test_file, 'rb') as f:
+                sample_data = pickle.load(f)
+
+            instance_path = sample_data.get('instance', '')
+            if not instance_path or not os.path.exists(instance_path):
+                log(f"  [SKIP] Sample {i+1}: instance not found ({instance_path})",
+                    logfile)
+                n_skipped += 1
+                continue
+
+            # Count variables from observation
+            _, _, var_feats = sample_data['observation']
+            n_vars = len(var_feats)
+
+            try:
+                t0 = time.time()
+                status, obj, info = solve_instance(
+                    instance_path, solver_name, time_limit, verbose)
+                wall_time = time.time() - t0
+                solving_time = info.get('solving_time', wall_time)
+            except Exception as e:
+                log(f"  [ERROR] Sample {i+1}: {e}", logfile)
+                n_skipped += 1
+                continue
+
+            gap_str = (f"{info['mip_gap']:.4f}"
+                       if info.get('mip_gap') is not None else 'N/A')
+            viol_str = (f"{info['max_violation']:.2e}"
+                        if info.get('max_violation') is not None else 'N/A')
+
+            print(f"[{i+1:4d}/{len(test_files)}] {os.path.basename(instance_path)}"
+                  f"  vars={n_vars}"
+                  f"  obj={obj}  t={solving_time:.2f}s"
+                  f"  status={status}  gap={gap_str}"
+                  f"  feasible={info.get('feasible')}  max_viol={viol_str}",
+                  flush=True)
+
+            row = {
+                'sample': i + 1,
+                'instance': os.path.basename(instance_path),
+                'n_vars': n_vars,
+                'obj_baseline': obj,
+                'time_baseline': f"{solving_time:.3f}",
+                'status_baseline': status,
+                'mip_gap': info.get('mip_gap'),
+                'feasible': info.get('feasible'),
+                'max_violation': info.get('max_violation'),
+            }
+            writer.writerow(row)
+            csvfile.flush()
+
+            times.append(solving_time)
+            statuses.append(status)
+            if obj is not None:
+                objs.append(obj)
+
+    # ---- Summary ----
+    n_done = len(times)
+    log(f"{'='*60}", logfile)
+    log(f"Baseline Summary ({n_done} solved, {n_skipped} skipped,"
+        f" solver={solver_name}, time_limit={time_limit}s)", logfile)
+    log(f"{'='*60}", logfile)
+
+    if not times:
+        log("  No samples completed.", logfile)
+        log(f"Results saved to {results_csv}", logfile)
+        return
+
+    n_opt = sum(1 for s in statuses if s == 'optimal')
+    n_tl  = sum(1 for s in statuses if s.startswith('timelimit'))
+    n_inf = sum(1 for s in statuses if s == 'infeasible')
+
+    log(f"  Avg time (s) : {np.mean(times):.3f}", logfile)
+    log(f"  Min time (s) : {np.min(times):.3f}", logfile)
+    log(f"  Max time (s) : {np.max(times):.3f}", logfile)
+    if objs:
+        log(f"  Avg obj      : {np.mean(objs):.4f}", logfile)
+        log(f"  Min obj      : {np.min(objs):.4f}", logfile)
+        log(f"  Max obj      : {np.max(objs):.4f}", logfile)
+    log(f"  Optimal      : {n_opt}", logfile)
+    log(f"  Timelimit*   : {n_tl}", logfile)
+    log(f"  Infeasible   : {n_inf}", logfile)
+    log(f"Results saved to {results_csv}", logfile)
+
+
+# ======================================================================
+# Main
+# ======================================================================
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+        description='Gurobi-only baseline evaluation (no model).')
+    parser.add_argument(
+        'problem',
+        choices=['setcover', 'cauctions', 'facilities', 'indset', 'mknapsack'],
+    )
+    parser.add_argument('-s', '--seed', type=int, default=0)
+    parser.add_argument(
+        '--solver', choices=['gurobi', 'scip'], default='gurobi',
+    )
+    parser.add_argument('--time-limit', type=float, default=300,
+                        help='Solver time limit in seconds (default: 300).')
+    parser.add_argument('--verbose', action='store_true')
+    args = parser.parse_args()
+
+    problem_folders = {
+        'setcover':   'setcover/500r_1000c_0.05d',
+        'cauctions':  'cauctions/100_500',
+        'facilities': 'facilities/100_100_5',
+        'indset':     'indset/500_4',
+        'mknapsack':  'mknapsack/100_6',
+    }
+
+    run_dir = pathlib.Path(
+        f'trained_models/optiflow/{args.problem}/{args.seed}')
+    data_dir = pathlib.Path('data/samples') / problem_folders[args.problem]
+
+    # Prefer test split, fall back to valid then train
+    for split in ('test', 'valid', 'train'):
+        test_data_dir = data_dir / split
+        if test_data_dir.exists() and list(test_data_dir.glob('sample_*.pkl')):
+            break
+    else:
+        print(f"No data found in {data_dir}")
+        sys.exit(1)
+
+    # Append to train_log.txt if the run_dir exists, otherwise just print
+    logfile = None
+    if run_dir.exists():
+        logfile = str(run_dir / 'train_log.txt')
+
+    log(f"Problem : {args.problem}", logfile)
+    log(f"Data dir: {test_data_dir}", logfile)
+    log(f"Solver  : {args.solver}, time limit: {args.time_limit}s", logfile)
+
+    evaluate_baseline(
+        test_data_dir,
+        solver_name=args.solver,
+        time_limit=args.time_limit,
+        verbose=args.verbose,
+        logfile=logfile,
+    )

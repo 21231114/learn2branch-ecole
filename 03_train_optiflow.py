@@ -30,6 +30,11 @@ import time
 import json
 import numpy as np
 
+# Pre-parse GPU flag so CUDA_VISIBLE_DEVICES is set before torch initializes CUDA
+_gpu = next((int(sys.argv[i + 2]) for i, a in enumerate(sys.argv[1:])
+             if a in ('-g', '--gpu') and i + 2 < len(sys.argv)), 0)
+os.environ['CUDA_VISIBLE_DEVICES'] = '' if _gpu == -1 else str(_gpu)
+
 import torch
 import torch.nn.functional as F
 import torch_geometric
@@ -376,7 +381,7 @@ if __name__ == "__main__":
         description='Train OptiFlow 4-step model for MILP solution prediction.')
     parser.add_argument(
         'problem',
-        choices=['setcover', 'cauctions', 'facilities', 'indset', 'mknapsack'],
+        choices=['setcover', 'cauctions', 'facilities', 'indset', 'mknapsack', 'SC'],
         help='MILP instance type.',
     )
     parser.add_argument('-s', '--seed', type=int, default=0)
@@ -394,10 +399,8 @@ if __name__ == "__main__":
 
     # ---- Device ----
     if args.gpu == -1:
-        os.environ['CUDA_VISIBLE_DEVICES'] = ''
         device = 'cpu'
     else:
-        os.environ['CUDA_VISIBLE_DEVICES'] = f'{args.gpu}'
         device = 'cuda:0'
 
     # ---- Seed ----
@@ -413,6 +416,7 @@ if __name__ == "__main__":
         'facilities': 'facilities/100_100_5',
         'indset': 'indset/500_4',
         'mknapsack': 'mknapsack/100_6',
+        'SC': 'SC',
     }
     data_dir = pathlib.Path('data/samples') / problem_folders[args.problem]
     run_dir = pathlib.Path(f'trained_models/optiflow/{args.problem}/{args.seed}')

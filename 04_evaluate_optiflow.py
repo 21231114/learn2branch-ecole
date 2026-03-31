@@ -18,6 +18,20 @@ Usage:
 
 import os
 import sys
+
+# Must set CUDA_VISIBLE_DEVICES before importing torch
+def _pre_parse_gpu():
+    for i, arg in enumerate(sys.argv):
+        if arg in ('-g', '--gpu') and i + 1 < len(sys.argv):
+            gpu = sys.argv[i + 1]
+            if gpu == '-1':
+                os.environ['CUDA_VISIBLE_DEVICES'] = ''
+            else:
+                os.environ['CUDA_VISIBLE_DEVICES'] = gpu
+            return
+    os.environ.setdefault('CUDA_VISIBLE_DEVICES', '0')
+_pre_parse_gpu()
+
 import argparse
 import pathlib
 import time
@@ -39,10 +53,8 @@ import torch_geometric
 def setup_and_import(args):
     """Set up device and import model modules."""
     if args.gpu == -1:
-        os.environ['CUDA_VISIBLE_DEVICES'] = ''
         device = 'cpu'
     else:
-        os.environ['CUDA_VISIBLE_DEVICES'] = f'{args.gpu}'
         device = 'cuda:0'
     return device
 
@@ -89,7 +101,7 @@ def load_model(model_dir, device):
 
     model_path = model_dir / 'best_model.pt'
     if model_path.exists():
-        model.load_state_dict(torch.load(model_path, map_location=device))
+        model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
         print(f"Loaded model from {model_path}")
     else:
         print(f"WARNING: No model weights found at {model_path}")
@@ -244,21 +256,47 @@ def evaluate_predictions(model, data_dir, device, verbose=False):
 # Mode 2: Solver handoff
 # ======================================================================
 
+def load_baseline_results(data_dir, solver_name):
+    """
+    Load pre-computed baseline results from 04_evaluate_baseline.py output CSV.
+
+    Returns a dict mapping instance basename -> (obj, time, status).
+    """
+    csv_path = data_dir.parent / f'baseline_results_{solver_name}.csv'
+    if not csv_path.exists():
+        return None, str(csv_path)
+
+    import csv as _csv
+    baseline = {}
+    with open(csv_path, newline='') as f:
+        for row in _csv.DictReader(f):
+            obj = float(row['obj_baseline']) if row['obj_baseline'] not in ('', 'None') else None
+            t   = float(row['time_baseline']) if row['time_baseline'] not in ('', 'None') else None
+            baseline[row['instance']] = (obj, t, row['status_baseline'])
+    return baseline, str(csv_path)
+
+
 def evaluate_solver_handoff(model, data_dir, instance_dir, device,
                             solver_name='gurobi', time_limit=60,
                             verbose=False):
     """
     Evaluate solver handoff: model predictions → fix variables → solve.
 
-    Compares:
-        1. Solver alone (baseline)
-        2. Solver with model fixings (trust region)
-        3. Solver with MIP Start
+    Compares against pre-computed baseline results from baseline_results_{solver}.csv
+    (produced by 04_evaluate_baseline.py).  Run that script first.
     """
+    import re
     from model.deslicing_decoder import extract_var_types
     from model.solver_handoff import TrustRegionSolver
 
-    test_files = sorted(str(f) for f in data_dir.glob('sample_*.pkl'))
+    def _numeric_key(path):
+        nums = re.findall(r'\d+', os.path.basename(path))
+        return int(nums[-1]) if nums else 0
+
+    test_files = sorted(
+        (str(f) for f in data_dir.glob('sample_*.pkl')),
+        key=_numeric_key,
+    )
     if not test_files:
         print(f"No test files found in {data_dir}")
         return
@@ -266,6 +304,7 @@ def evaluate_solver_handoff(model, data_dir, instance_dir, device,
     print(f"\n{'='*60}")
     print(f"Solver Handoff Evaluation — {len(test_files)} samples")
     print(f"Solver: {solver_name}, Time limit: {time_limit}s")
+    print(f"Note: handoff time = model inference + {solver_name} post-processing")
     print(f"{'='*60}")
 
     solver = TrustRegionSolver(
@@ -274,12 +313,27 @@ def evaluate_solver_handoff(model, data_dir, instance_dir, device,
         time_limit=time_limit, verbose=verbose,
     )
 
+    # ---- Load pre-computed baseline results ----
+    baseline_map, baseline_csv = load_baseline_results(data_dir, solver_name)
+    if baseline_map is None:
+        print(f"  [WARNING] Baseline results not found at {baseline_csv}")
+        print(f"  Run 04_evaluate_baseline.py first to generate baseline results.")
+        print(f"  Continuing without baseline comparison.")
+
     results_csv = str(data_dir.parent / f'handoff_results_{solver_name}.csv')
     fieldnames = ['sample', 'instance', 'n_vars', 'n_fixed',
                   'backtrack_step', 'obj_baseline', 'obj_handoff',
-                  'time_baseline', 'time_handoff',
+                  'time_baseline', 'time_e2e',
+                  'time_prep', 'time_infer', 'time_fixing', 'time_solver',
                   'status_baseline', 'status_handoff',
                   'improvement_pct']
+
+    # Accumulators for summary statistics
+    times_base, times_e2e = [], []
+    times_prep, times_infer, times_fixing, times_solver_hand = [], [], [], []
+    objs_base, objs_hand = [], []
+    statuses_base, statuses_hand = [], []
+    n_skipped = 0
 
     with open(results_csv, 'w', newline='') as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
@@ -291,11 +345,20 @@ def evaluate_solver_handoff(model, data_dir, instance_dir, device,
 
             instance_path = sample_data.get('instance', '')
             if not instance_path or not os.path.exists(instance_path):
-                if verbose:
-                    print(f"  Sample {i+1}: instance not found, skipping solver")
+                print(f"  [SKIP] Sample {i+1}: instance not found ({instance_path})", flush=True)
+                n_skipped += 1
                 continue
 
-            # Load observation
+            instance_name = os.path.basename(instance_path)
+
+            # Get variable names
+            sol_info = sample_data.get('solution', {})
+            var_names = None
+            if sol_info.get('sol_vals'):
+                var_names = list(sol_info['sol_vals'].keys())
+
+            # Load observation — tensor preparation
+            t_prep_start = time.time()
             cons_feats, (edge_idx, edge_vals), var_feats = \
                 sample_data['observation']
             cons_feats = torch.FloatTensor(
@@ -306,46 +369,38 @@ def evaluate_solver_handoff(model, data_dir, instance_dir, device,
                 np.asarray(edge_vals, dtype=np.float32)).unsqueeze(-1).to(device)
             var_feats = torch.FloatTensor(
                 np.asarray(var_feats, dtype=np.float32)).to(device)
-
             n_vars = var_feats.shape[0]
             var_batch = torch.zeros(n_vars, dtype=torch.long, device=device)
+            time_prep = time.time() - t_prep_start
 
-            # ---- Model prediction ----
+            # ---- Lookup baseline from pre-computed results ----
+            if baseline_map is not None and instance_name in baseline_map:
+                obj_base, time_base, status_base = baseline_map[instance_name]
+            else:
+                obj_base, time_base, status_base = None, None, 'N/A'
+
+            # ---- Handoff: model inference + solver with fixings ----
+            t_infer_start = time.time()
             with torch.no_grad():
                 result, var_types, _, _, _ = model(
                     cons_feats, edge_idx, edge_vals, var_feats,
                     var_batch=var_batch,
                 )
+            time_infer = time.time() - t_infer_start
 
-            # Get variable names from solution data
-            sol_info = sample_data.get('solution', {})
-            var_names = None
-            if sol_info.get('sol_vals'):
-                var_names = list(sol_info['sol_vals'].keys())
-
-            # ---- Baseline: solver alone ----
-            t0 = time.time()
-            try:
-                sol_base, status_base, obj_base, info_base = solver._solve(
-                    instance_path, {}, var_names)
-                time_base = time.time() - t0
-            except Exception as e:
-                if verbose:
-                    print(f"  Sample {i+1}: baseline solver error: {e}")
-                continue
-
-            # ---- Handoff: solver with fixings ----
-            t1 = time.time()
+            t_fix_start = time.time()
             try:
                 sol_hand, status_hand, obj_hand, info_hand = \
                     solver.backtracking_solve(
                         instance_path, result, n_vars, var_types,
                         var_names=var_names, use_mip_start=True,
                     )
-                time_hand = time.time() - t1
+                time_solver_h = info_hand.get('solving_time', 0.0)
+                time_fixing = (time.time() - t_fix_start) - time_solver_h
+                time_e2e = time_infer + time_fixing + time_solver_h
             except Exception as e:
-                if verbose:
-                    print(f"  Sample {i+1}: handoff solver error: {e}")
+                print(f"  [ERROR] Sample {i+1}: handoff solver error: {e}", flush=True)
+                n_skipped += 1
                 continue
 
             # ---- Compare ----
@@ -353,16 +408,24 @@ def evaluate_solver_handoff(model, data_dir, instance_dir, device,
             if obj_base is not None and obj_hand is not None and obj_base != 0:
                 improvement = (obj_base - obj_hand) / abs(obj_base) * 100
 
+            gap_hand = info_hand.get('mip_gap', None)
+            viol_hand = info_hand.get('max_violation', None)
+            feas_hand = info_hand.get('feasible', False)
+
             row = {
                 'sample': i + 1,
-                'instance': os.path.basename(instance_path),
+                'instance': instance_name,
                 'n_vars': n_vars,
                 'n_fixed': info_hand.get('n_fixed', 0),
                 'backtrack_step': info_hand.get('backtrack_step', 0),
                 'obj_baseline': obj_base,
                 'obj_handoff': obj_hand,
-                'time_baseline': f"{time_base:.2f}",
-                'time_handoff': f"{time_hand:.2f}",
+                'time_baseline': f"{time_base:.3f}" if time_base is not None else 'N/A',
+                'time_e2e': f"{time_e2e:.3f}",
+                'time_prep': f"{time_prep:.3f}",
+                'time_infer': f"{time_infer:.3f}",
+                'time_fixing': f"{time_fixing:.3f}",
+                'time_solver': f"{time_solver_h:.3f}",
                 'status_baseline': status_base,
                 'status_handoff': status_hand,
                 'improvement_pct': f"{improvement:.2f}",
@@ -370,16 +433,90 @@ def evaluate_solver_handoff(model, data_dir, instance_dir, device,
             writer.writerow(row)
             csvfile.flush()
 
-            if verbose or i < 3:
-                print(f"\n  Sample {i+1}: {os.path.basename(instance_path)}")
-                print(f"    Vars: {n_vars}, "
-                      f"Fixed: {info_hand.get('n_fixed', 0)}")
-                print(f"    Baseline: obj={obj_base}, "
-                      f"time={time_base:.2f}s, status={status_base}")
-                print(f"    Handoff:  obj={obj_hand}, "
-                      f"time={time_hand:.2f}s, status={status_hand}")
-                if improvement != 0:
-                    print(f"    Speedup or improvement: {improvement:.2f}%")
+            if time_base is not None:
+                times_base.append(time_base)
+            times_e2e.append(time_e2e)
+            times_prep.append(time_prep)
+            times_infer.append(time_infer)
+            times_fixing.append(time_fixing)
+            times_solver_hand.append(time_solver_h)
+            if status_base != 'N/A':
+                statuses_base.append(status_base)
+            statuses_hand.append(status_hand)
+            if obj_base is not None:
+                objs_base.append(obj_base)
+            if obj_hand is not None:
+                objs_hand.append(obj_hand)
+
+            # Per-sample log
+            gap_hand_str = f"{gap_hand:.4f}" if gap_hand is not None else "N/A"
+            viol_hand_str = f"{viol_hand:.2e}" if viol_hand is not None else "N/A"
+            time_base_str = f"{time_base:.2f}s" if time_base is not None else "N/A"
+
+            print(f"\n[{i+1:4d}/{len(test_files)}] {instance_name}"
+                  f"  vars={n_vars}  fixed={info_hand.get('n_fixed', 0)}", flush=True)
+            print(f"    baseline: obj={obj_base}  t={time_base_str}"
+                  f"  status={status_base}", flush=True)
+            print(f"    handoff:  obj={obj_hand}  t={time_e2e:.2f}s"
+                  f"  (prep={time_prep:.2f}s  infer={time_infer:.2f}s"
+                  f"  fixing={time_fixing:.2f}s  solver={time_solver_h:.2f}s)"
+                  f"  status={status_hand}  gap={gap_hand_str}"
+                  f"  feasible={feas_hand}  max_viol={viol_hand_str}", flush=True)
+            if obj_base is not None and obj_hand is not None:
+                speedup_str = (f"  speedup={time_base/max(time_e2e,1e-6):.2f}x"
+                               if time_base is not None else "")
+                print(f"    Δobj={improvement:+.2f}%{speedup_str}", flush=True)
+
+    # ---- Summary statistics ----
+    n_done = len(times_e2e)
+    print(f"\n{'='*70}")
+    print(f"Summary ({n_done} solved, {n_skipped} skipped, time_limit={time_limit}s)")
+    print(f"{'='*70}")
+
+    if not times_e2e:
+        print("  No samples completed.")
+        print(f"\nResults saved to {results_csv}")
+        return
+
+    n_opt_hand = sum(1 for s in statuses_hand if s == 'optimal')
+    n_tl_hand = sum(1 for s in statuses_hand if s.startswith('timelimit'))
+    n_inf_hand = sum(1 for s in statuses_hand if s == 'infeasible')
+
+    has_base = bool(times_base)
+    base_col = f"{np.mean(times_base):>15.3f}" if has_base else f"{'N/A':>15s}"
+    base_obj = f"{np.mean(objs_base):>15.4f}" if objs_base else f"{'N/A':>15s}"
+
+    print(f"\n  {'':30s} {'Baseline':>15s} {'Handoff':>15s}")
+    print(f"  {'-'*62}")
+    print(f"  {'Avg time (s)':30s} {base_col} {np.mean(times_e2e):>15.3f}")
+    print(f"  {'  infer (s)':30s} {'':>15s} {np.mean(times_infer):>15.3f}")
+    print(f"  {'  fixing (s)':30s} {'':>15s} {np.mean(times_fixing):>15.3f}")
+    print(f"  {'  solver (s)':30s} {'':>15s} {np.mean(times_solver_hand):>15.3f}")
+    if objs_hand:
+        print(f"  {'Avg obj':30s} {base_obj} {np.mean(objs_hand):>15.4f}")
+    print(f"  {'Optimal':30s} {'':>15s} {n_opt_hand:>15d}")
+    print(f"  {'Timelimit (with solution)':30s} {'':>15s} {n_tl_hand:>15d}")
+    print(f"  {'Infeasible':30s} {'':>15s} {n_inf_hand:>15d}")
+
+    if has_base and objs_base and objs_hand:
+        paired_better = 0
+        paired_equal = 0
+        paired_worse = 0
+        for ob, oh in zip(objs_base, objs_hand):
+            if abs(ob - oh) < 1e-6:
+                paired_equal += 1
+            elif oh < ob:
+                paired_better += 1
+            else:
+                paired_worse += 1
+
+        print(f"\n  Pairwise objective comparison (on {len(objs_base)} instances with solutions):")
+        print(f"    Handoff better : {paired_better}")
+        print(f"    Equal          : {paired_equal}")
+        print(f"    Handoff worse  : {paired_worse}")
+
+        speedup = np.mean(times_base) / np.mean(times_e2e)
+        print(f"\n  Avg speedup: {speedup:.2f}x")
 
     print(f"\nResults saved to {results_csv}")
 
@@ -405,7 +542,8 @@ if __name__ == "__main__":
         '--solver', choices=['gurobi', 'scip'], default='gurobi',
         help='Solver for handoff mode.',
     )
-    parser.add_argument('--time-limit', type=float, default=60)
+    parser.add_argument('--time-limit', type=float, default=300,
+                        help='Solver time limit in seconds (default: 300).')
     parser.add_argument('--verbose', action='store_true')
     args = parser.parse_args()
 

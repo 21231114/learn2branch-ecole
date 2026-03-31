@@ -218,8 +218,10 @@ class TrustRegionSolver:
         import gurobipy as gp
         from gurobipy import GRB
 
-        model = gp.read(instance_path)
-        model.setParam('OutputFlag', 1 if self.verbose else 0)
+        env = gp.Env(empty=True)
+        env.setParam('OutputFlag', 1 if self.verbose else 0)
+        env.start()
+        model = gp.read(instance_path, env)
         model.setParam('TimeLimit', self.time_limit)
         model.setParam('Threads', self.threads)
 
@@ -277,10 +279,25 @@ class TrustRegionSolver:
         if model.SolCount > 0:
             solution = {v.VarName: v.X for v in grb_vars}
             obj_val = model.ObjVal
+            # MIP gap and constraint info
+            try:
+                info['mip_gap'] = model.MIPGap
+            except Exception:
+                info['mip_gap'] = 0.0
+            info['feasible'] = True
+            # Check constraint violations
+            try:
+                max_viol = model.MaxVio
+                info['max_violation'] = max_viol
+            except Exception:
+                info['max_violation'] = 0.0
             if status == 'timelimit':
-                status = 'feasible'
+                status = 'timelimit*'  # timelimit but has feasible solution
             return solution, status, obj_val, info
         else:
+            info['mip_gap'] = None
+            info['feasible'] = False
+            info['max_violation'] = None
             return None, status, None, info
 
     # ------------------------------------------------------------------
