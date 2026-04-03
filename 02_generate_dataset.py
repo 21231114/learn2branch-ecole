@@ -568,11 +568,75 @@ def collect_samples_gurobi(instances, out_dir, rng, n_jobs, time_limit):
     print(f"Done collecting samples for {out_dir} ({n_saved}/{n_total} saved)")
 
 
+def process_custom_datasets(dataset_dirs, args):
+    """
+    Process user-specified dataset directories sequentially.
+
+    For each directory, finds all .lp files, processes them, and saves
+    samples to <dir>_samples/ (or --out-dir if specified).
+
+    Parameters
+    ----------
+    dataset_dirs : list of str
+        Paths to directories containing .lp instance files.
+    args : argparse.Namespace
+        Parsed command-line arguments.
+    """
+    collect_fn = collect_samples_gurobi if args.solver == 'gurobi' else collect_samples
+    tl = args.time_limit if args.solver == 'gurobi' else 3600
+
+    for idx, dataset_dir in enumerate(dataset_dirs):
+        dataset_dir = dataset_dir.rstrip('/')
+        if not os.path.isdir(dataset_dir):
+            print(f"WARNING: '{dataset_dir}' is not a directory, skipping.")
+            continue
+
+        instances = sorted(
+            glob.glob(os.path.join(dataset_dir, '*.lp'))
+            + glob.glob(os.path.join(dataset_dir, '*.mps')),
+            key=lambda f: extract_instance_number(f) or 0)
+        if not instances:
+            print(f"WARNING: no .lp/.mps files found in '{dataset_dir}', skipping.")
+            continue
+
+        if args.out_dir:
+            if len(dataset_dirs) == 1:
+                out_dir = args.out_dir
+            else:
+                out_dir = os.path.join(args.out_dir, os.path.basename(dataset_dir))
+        else:
+            out_dir = dataset_dir + '_samples'
+
+        print(f"\n{'='*60}")
+        print(f"[{idx+1}/{len(dataset_dirs)}] Processing: {dataset_dir}")
+        print(f"  instances: {len(instances)}")
+        print(f"  output:    {out_dir}")
+        print(f"  solver:    {args.solver}")
+        print(f"  time_limit: {tl}s")
+        print(f"{'='*60}")
+
+        rng = np.random.RandomState(args.seed + idx)
+        collect_fn(instances, out_dir, rng, args.njobs, time_limit=tl)
+
+    print(f"\nAll {len(dataset_dirs)} dataset(s) processed.")
+
+
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description='Generate bipartite graph samples from MILP instances. '
+                    'Either pass dataset directories directly, or use -p to '
+                    'select a built-in problem type.',
+    )
     parser.add_argument(
-        'problem',
-        help='MILP instance type to process.',
+        'datasets',
+        nargs='*',
+        help='Paths to directories containing .lp instance files. '
+             'Each directory is processed sequentially. '
+             'Output is saved to <dir>_samples/ by default (see --out-dir).',
+    )
+    parser.add_argument(
+        '-p', '--problem',
+        help='Built-in MILP instance type to process.',
         choices=['setcover', 'cauctions', 'facilities', 'indset', 'mknapsack', 'SC'],
     )
     parser.add_argument(
@@ -595,122 +659,135 @@ if __name__ == '__main__':
     )
     parser.add_argument(
         '--time-limit',
-        help='[Gurobi] Time limit in seconds. Stop and save current best solution. '
-             '(default: 600)',
+        help='Time limit in seconds per instance (default: 600).',
         type=float,
         default=600,
     )
+    parser.add_argument(
+        '-o', '--out-dir',
+        help='Override output directory. When processing a single dataset, '
+             'samples are saved here directly. With multiple datasets, a '
+             'subdirectory per dataset is created under this path.',
+        default=None,
+    )
     args = parser.parse_args()
 
-    print(f"seed {args.seed}")
-    print(f"solver: {args.solver}")
+    # ── Custom dataset directories mode ──
+    if args.datasets:
+        print(f"seed {args.seed}")
+        print(f"solver: {args.solver}")
+        process_custom_datasets(args.datasets, args)
 
-    time_limit = 3600
+    # ── Built-in problem mode ──
+    elif args.problem:
+        print(f"seed {args.seed}")
+        print(f"solver: {args.solver}")
 
-    if args.problem == 'setcover':
-        instances_train = glob.glob('data/instances/setcover/train_500r_1000c_0.05d/*.lp')
-        instances_valid = glob.glob('data/instances/setcover/valid_500r_1000c_0.05d/*.lp')
-        instances_test = glob.glob('data/instances/setcover/test_500r_1000c_0.05d/*.lp')
-        out_dir = 'data/samples/setcover/500r_1000c_0.05d'
-        # transfer sets: generalization test sets with different row counts
-        transfer_configs = [
-            ('data/instances/setcover/transfer_500r_1000c_0.05d',  'data/samples/setcover/500r_1000c_0.05d/transfer'),
-            ('data/instances/setcover/transfer_1000r_1000c_0.05d', 'data/samples/setcover/1000r_1000c_0.05d/transfer'),
-            ('data/instances/setcover/transfer_2000r_1000c_0.05d', 'data/samples/setcover/2000r_1000c_0.05d/transfer'),
-        ]
+        time_limit = 3600
 
-    elif args.problem == 'cauctions':
-        instances_train = glob.glob('data/instances/cauctions/train_100_500/*.lp')
-        instances_valid = glob.glob('data/instances/cauctions/valid_100_500/*.lp')
-        instances_test = glob.glob('data/instances/cauctions/test_100_500/*.lp')
-        out_dir = 'data/samples/cauctions/100_500'
+        if args.problem == 'setcover':
+            instances_train = glob.glob('data/instances/setcover/train_500r_1000c_0.05d/*.lp')
+            instances_valid = glob.glob('data/instances/setcover/valid_500r_1000c_0.05d/*.lp')
+            instances_test = glob.glob('data/instances/setcover/test_500r_1000c_0.05d/*.lp')
+            out_dir = 'data/samples/setcover/500r_1000c_0.05d'
+            transfer_configs = [
+                ('data/instances/setcover/transfer_500r_1000c_0.05d',  'data/samples/setcover/500r_1000c_0.05d/transfer'),
+                ('data/instances/setcover/transfer_1000r_1000c_0.05d', 'data/samples/setcover/1000r_1000c_0.05d/transfer'),
+                ('data/instances/setcover/transfer_2000r_1000c_0.05d', 'data/samples/setcover/2000r_1000c_0.05d/transfer'),
+            ]
 
-    elif args.problem == 'indset':
-        instances_train = glob.glob('data/instances/indset/train_500_4/*.lp')
-        instances_valid = glob.glob('data/instances/indset/valid_500_4/*.lp')
-        instances_test = glob.glob('data/instances/indset/test_500_4/*.lp')
-        out_dir = 'data/samples/indset/500_4'
+        elif args.problem == 'cauctions':
+            instances_train = glob.glob('data/instances/cauctions/train_100_500/*.lp')
+            instances_valid = glob.glob('data/instances/cauctions/valid_100_500/*.lp')
+            instances_test = glob.glob('data/instances/cauctions/test_100_500/*.lp')
+            out_dir = 'data/samples/cauctions/100_500'
 
-    elif args.problem == 'facilities':
-        instances_train = glob.glob('data/instances/facilities/train_100_100_5/*.lp')
-        instances_valid = glob.glob('data/instances/facilities/valid_100_100_5/*.lp')
-        instances_test = glob.glob('data/instances/facilities/test_100_100_5/*.lp')
-        out_dir = 'data/samples/facilities/100_100_5'
-        time_limit = 600
+        elif args.problem == 'indset':
+            instances_train = glob.glob('data/instances/indset/train_500_4/*.lp')
+            instances_valid = glob.glob('data/instances/indset/valid_500_4/*.lp')
+            instances_test = glob.glob('data/instances/indset/test_500_4/*.lp')
+            out_dir = 'data/samples/indset/500_4'
 
-    elif args.problem == 'mknapsack':
-        instances_train = glob.glob('data/instances/mknapsack/train_100_6/*.lp')
-        instances_valid = glob.glob('data/instances/mknapsack/valid_100_6/*.lp')
-        instances_test = glob.glob('data/instances/mknapsack/test_100_6/*.lp')
-        out_dir = 'data/samples/mknapsack/100_6'
-        time_limit = 60
+        elif args.problem == 'facilities':
+            instances_train = glob.glob('data/instances/facilities/train_100_100_5/*.lp')
+            instances_valid = glob.glob('data/instances/facilities/valid_100_100_5/*.lp')
+            instances_test = glob.glob('data/instances/facilities/test_100_100_5/*.lp')
+            out_dir = 'data/samples/facilities/100_100_5'
+            time_limit = 600
 
-    elif args.problem == 'SC':
-        # l2o_milp/SC: 300 train instances, 100 test instances, no split in this script
-        instances_train = sorted(glob.glob('data/l2o_milp/SC/*.lp'),
-                                  key=lambda f: extract_instance_number(f))
-        instances_valid = []
-        instances_test = sorted(glob.glob('data/l2o_milp_test/SC/*.lp'),
-                                key=lambda f: extract_instance_number(f))
-        out_dir = 'data/samples/SC'
-        time_limit = 600
+        elif args.problem == 'mknapsack':
+            instances_train = glob.glob('data/instances/mknapsack/train_100_6/*.lp')
+            instances_valid = glob.glob('data/instances/mknapsack/valid_100_6/*.lp')
+            instances_test = glob.glob('data/instances/mknapsack/test_100_6/*.lp')
+            out_dir = 'data/samples/mknapsack/100_6'
+            time_limit = 60
+
+        elif args.problem == 'SC':
+            instances_train = sorted(glob.glob('data/l2o_milp/SC/*.lp'),
+                                      key=lambda f: extract_instance_number(f))
+            instances_valid = []
+            instances_test = sorted(glob.glob('data/l2o_milp_test/SC/*.lp'),
+                                    key=lambda f: extract_instance_number(f))
+            out_dir = 'data/samples/SC'
+            time_limit = 600
+
+        else:
+            raise NotImplementedError
+
+        if 'transfer_configs' not in dir():
+            transfer_configs = []
+
+        print(f"{len(instances_train)} train instances")
+        print(f"{len(instances_valid)} validation instances")
+        print(f"{len(instances_test)} test instances")
+
+        os.makedirs(out_dir, exist_ok=True)
+
+        if args.solver == 'scip':
+            rng = np.random.RandomState(args.seed)
+            collect_samples(instances_train, out_dir + '/train', rng, args.njobs,
+                            time_limit=time_limit)
+
+            if instances_valid:
+                rng = np.random.RandomState(args.seed + 1)
+                collect_samples(instances_valid, out_dir + '/valid', rng, args.njobs,
+                                time_limit=time_limit)
+
+            if instances_test:
+                rng = np.random.RandomState(args.seed + 2)
+                collect_samples(instances_test, out_dir + '/test', rng, args.njobs,
+                                time_limit=time_limit)
+
+            for i, (inst_dir, transfer_out_dir) in enumerate(transfer_configs):
+                instances_transfer = glob.glob(f'{inst_dir}/*.lp')
+                if instances_transfer:
+                    rng = np.random.RandomState(args.seed + 3 + i)
+                    collect_samples(instances_transfer, transfer_out_dir, rng,
+                                    args.njobs, time_limit=time_limit)
+
+        elif args.solver == 'gurobi':
+            print(f"Gurobi settings: time_limit={args.time_limit}s")
+
+            rng = np.random.RandomState(args.seed)
+            collect_samples_gurobi(instances_train, out_dir + '/train', rng,
+                                   args.njobs, args.time_limit)
+
+            if instances_valid:
+                rng = np.random.RandomState(args.seed + 1)
+                collect_samples_gurobi(instances_valid, out_dir + '/valid', rng,
+                                       args.njobs, args.time_limit)
+
+            if instances_test:
+                rng = np.random.RandomState(args.seed + 2)
+                collect_samples_gurobi(instances_test, out_dir + '/test', rng,
+                                       args.njobs, args.time_limit)
+
+            for i, (inst_dir, transfer_out_dir) in enumerate(transfer_configs):
+                instances_transfer = glob.glob(f'{inst_dir}/*.lp')
+                if instances_transfer:
+                    rng = np.random.RandomState(args.seed + 3 + i)
+                    collect_samples_gurobi(instances_transfer, transfer_out_dir, rng,
+                                           args.njobs, args.time_limit)
 
     else:
-        raise NotImplementedError
-
-    if 'transfer_configs' not in dir():
-        transfer_configs = []
-
-    print(f"{len(instances_train)} train instances")
-    print(f"{len(instances_valid)} validation instances")
-    print(f"{len(instances_test)} test instances")
-
-    os.makedirs(out_dir, exist_ok=True)
-
-    if args.solver == 'scip':
-        # ── Original SCIP-based generation ──
-        rng = np.random.RandomState(args.seed)
-        collect_samples(instances_train, out_dir + '/train', rng, args.njobs,
-                        time_limit=time_limit)
-
-        if instances_valid:
-            rng = np.random.RandomState(args.seed + 1)
-            collect_samples(instances_valid, out_dir + '/valid', rng, args.njobs,
-                            time_limit=time_limit)
-
-        if instances_test:
-            rng = np.random.RandomState(args.seed + 2)
-            collect_samples(instances_test, out_dir + '/test', rng, args.njobs,
-                            time_limit=time_limit)
-
-        for i, (inst_dir, transfer_out_dir) in enumerate(transfer_configs):
-            instances_transfer = glob.glob(f'{inst_dir}/*.lp')
-            if instances_transfer:
-                rng = np.random.RandomState(args.seed + 3 + i)
-                collect_samples(instances_transfer, transfer_out_dir, rng,
-                                args.njobs, time_limit=time_limit)
-
-    elif args.solver == 'gurobi':
-        # ── Gurobi-based generation ──
-        print(f"Gurobi settings: time_limit={args.time_limit}s")
-
-        rng = np.random.RandomState(args.seed)
-        collect_samples_gurobi(instances_train, out_dir + '/train', rng,
-                               args.njobs, args.time_limit)
-
-        if instances_valid:
-            rng = np.random.RandomState(args.seed + 1)
-            collect_samples_gurobi(instances_valid, out_dir + '/valid', rng,
-                                   args.njobs, args.time_limit)
-
-        if instances_test:
-            rng = np.random.RandomState(args.seed + 2)
-            collect_samples_gurobi(instances_test, out_dir + '/test', rng,
-                                   args.njobs, args.time_limit)
-
-        for i, (inst_dir, transfer_out_dir) in enumerate(transfer_configs):
-            instances_transfer = glob.glob(f'{inst_dir}/*.lp')
-            if instances_transfer:
-                rng = np.random.RandomState(args.seed + 3 + i)
-                collect_samples_gurobi(instances_transfer, transfer_out_dir, rng,
-                                       args.njobs, args.time_limit)
+        parser.error('Please provide dataset directories or use -p to select a built-in problem type.')

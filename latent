@@ -1,0 +1,11 @@
+sample,instance,n_vars,n_fixed,backtrack_step,obj_baseline,obj_handoff,time_baseline,time_e2e,time_prep,time_infer,time_fixing,time_solver,status_baseline,status_handoff,improvement_pct
+1,instance_1.lp,5000,4720,0,122.0,123.0,1000.007,3600.843,0.025,0.426,0.797,3599.620,timelimit*,timelimit*,-0.82
+2,instance_2.lp,5000,4724,0,122.0,120.0,1000.006,3600.841,0.011,0.063,0.794,3599.984,timelimit*,timelimit*,1.64
+3,instance_3.lp,5000,4760,0,129.0,127.0,1000.006,3601.047,0.012,0.062,1.002,3599.983,timelimit*,timelimit*,1.55
+4,instance_4.lp,5000,4740,0,135.0,135.0,1000.017,3600.784,0.013,0.062,0.744,3599.979,timelimit*,timelimit*,0.00
+5,instance_5.lp,5000,4754,0,127.0,127.0,1000.021,3600.812,0.010,0.061,0.769,3599.981,timelimit*,timelimit*,0.00
+6,instance_6.lp,5000,4742,0,128.0,128.0,1000.078,3600.838,0.011,0.062,0.792,3599.983,timelimit*,timelimit*,0.00
+7,instance_7.lp,5000,4759,0,126.0,125.0,1000.007,3600.809,0.010,0.061,0.765,3599.983,timelimit*,timelimit*,0.79
+8,instance_8.lp,5000,4749,0,,121.0,N/A,3600.842,0.013,0.061,0.800,3599.980,N/A,timelimit*,0.00
+9,instance_9.lp,5000,4715,0,,124.0,N/A,3600.832,0.013,0.062,0.787,3599.983,N/A,timelimit*,0.00
+10,instance_10.lp,5000,4724,0,,114.0,N/A,3600.802,0.011,0.062,0.763,3599.977,N/A,timelimit*,0.00

@@ -154,12 +154,20 @@ def evaluate_baseline(data_dir, solver_name, time_limit, verbose, logfile):
         'status_baseline', 'mip_gap', 'feasible', 'max_violation',
     ]
 
+    # Load already-completed instances from existing CSV
+    done_instances = set()
+    if os.path.exists(results_csv):
+        with open(results_csv, newline='') as f:
+            for row in csv.DictReader(f):
+                done_instances.add(row['instance'])
+
     times, objs, statuses = [], [], []
     n_skipped = 0
 
-    with open(results_csv, 'w', newline='') as csvfile:
+    with open(results_csv, 'a', newline='') as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
+        if not done_instances:
+            writer.writeheader()
 
         for i, test_file in enumerate(test_files):
             with gzip.open(test_file, 'rb') as f:
@@ -170,6 +178,11 @@ def evaluate_baseline(data_dir, solver_name, time_limit, verbose, logfile):
                 log(f"  [SKIP] Sample {i+1}: instance not found ({instance_path})",
                     logfile)
                 n_skipped += 1
+                continue
+
+            if os.path.basename(instance_path) in done_instances:
+                print(f"[{i+1:4d}/{len(test_files)}] {os.path.basename(instance_path)}  [already done, skip]",
+                      flush=True)
                 continue
 
             # Count variables from observation
@@ -255,10 +268,9 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description='Gurobi-only baseline evaluation (no model).')
     parser.add_argument(
-        'problem',
-        choices=['setcover', 'cauctions', 'facilities', 'indset', 'mknapsack'],
+        'data_dir',
+        help='Path to the directory containing sample_*.pkl files.',
     )
-    parser.add_argument('-s', '--seed', type=int, default=0)
     parser.add_argument(
         '--solver', choices=['gurobi', 'scip'], default='gurobi',
     )
@@ -267,33 +279,13 @@ if __name__ == '__main__':
     parser.add_argument('--verbose', action='store_true')
     args = parser.parse_args()
 
-    problem_folders = {
-        'setcover':   'setcover/500r_1000c_0.05d',
-        'cauctions':  'cauctions/100_500',
-        'facilities': 'facilities/100_100_5',
-        'indset':     'indset/500_4',
-        'mknapsack':  'mknapsack/100_6',
-    }
-
-    run_dir = pathlib.Path(
-        f'trained_models/optiflow/{args.problem}/{args.seed}')
-    data_dir = pathlib.Path('data/samples') / problem_folders[args.problem]
-
-    # Prefer test split, fall back to valid then train
-    for split in ('test', 'valid', 'train'):
-        test_data_dir = data_dir / split
-        if test_data_dir.exists() and list(test_data_dir.glob('sample_*.pkl')):
-            break
-    else:
-        print(f"No data found in {data_dir}")
+    test_data_dir = pathlib.Path(args.data_dir)
+    if not test_data_dir.exists() or not list(test_data_dir.glob('sample_*.pkl')):
+        print(f"No sample_*.pkl files found in {test_data_dir}")
         sys.exit(1)
 
-    # Append to train_log.txt if the run_dir exists, otherwise just print
-    logfile = None
-    if run_dir.exists():
-        logfile = str(run_dir / 'train_log.txt')
+    logfile = str(test_data_dir.parent / 'baseline_eval_log.txt')
 
-    log(f"Problem : {args.problem}", logfile)
     log(f"Data dir: {test_data_dir}", logfile)
     log(f"Solver  : {args.solver}, time limit: {args.time_limit}s", logfile)
 

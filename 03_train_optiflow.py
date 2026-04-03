@@ -350,16 +350,18 @@ def validate(model, loader, cv_loss_fn, config, device):
 def format_metrics(metrics, prefix=''):
     """Format metrics dict into a readable string."""
     parts = []
-    # Loss
+
+    # Total loss
     parts.append(f"loss={metrics['total_loss']:.4f}")
-    if metrics.get('loss_binary', 0) > 0:
-        parts.append(f"bin={metrics['loss_binary']:.4f}")
-    if metrics.get('loss_int_small', 0) > 0:
-        parts.append(f"is={metrics['loss_int_small']:.4f}")
-    if metrics.get('loss_int_large', 0) > 0:
-        parts.append(f"il={metrics['loss_int_large']:.4f}")
-    if metrics.get('loss_cv_penalty', 0) > 0:
-        parts.append(f"cv={metrics['loss_cv_penalty']:.4f}")
+
+    # Individual losses (always show)
+    parts.append(f"bin={metrics.get('loss_binary', 0):.4f}")
+    parts.append(f"is={metrics.get('loss_int_small', 0):.4f}")
+    parts.append(f"il={metrics.get('loss_int_large', 0):.4f}")
+    parts.append(f"rnd={metrics.get('loss_rounding', 0):.4f}")
+    parts.append(f"cv={metrics.get('loss_cv_penalty', 0):.4f}")
+    parts.append(f"ent={metrics.get('loss_entropy_reg', 0):.4f}")
+    parts.append(f"div={metrics.get('loss_diversity_reg', 0):.4f}")
 
     # Accuracy
     if metrics.get('n_bin', 0) > 0:
@@ -395,6 +397,8 @@ if __name__ == "__main__":
     parser.add_argument('--n-evolve-steps', type=int, default=3)
     parser.add_argument('--patience', type=int, default=15,
                         help='Early stopping patience.')
+    parser.add_argument('--loss-type', choices=['focal', 'bce'], default='focal',
+                        help='Binary loss type: "focal" (default) or "bce".')
     args = parser.parse_args()
 
     # ---- Device ----
@@ -472,8 +476,11 @@ if __name__ == "__main__":
         optimizer, T_max=args.epochs, eta_min=1e-6)
 
     # ---- Loss config ----
+    focal_gamma = 2.0 if args.loss_type == 'focal' else 0.0
+    log(f"Binary loss type: {args.loss_type} (gamma={focal_gamma})", logfile)
+
     config = {
-        'focal_gamma': 2.0,
+        'focal_gamma': focal_gamma,
         'ls_bin': 0.01,
         'ls_int': 0.05,
         'huber_delta': 1.0,
@@ -502,6 +509,7 @@ if __name__ == "__main__":
             'var_nfeats': var_nfeats,
             'lr': args.lr,
             'batch_size': args.batch_size,
+            'loss_type': args.loss_type,
             'n_params': n_params,
             'loss_config': config,
         }, f, indent=2)

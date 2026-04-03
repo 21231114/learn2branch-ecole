@@ -14,6 +14,9 @@ Usage:
 
     # Both modes with detailed output
     python 04_evaluate_optiflow.py setcover --mode both --verbose
+
+    # Use custom model weights and test data directory
+    python 04_evaluate_optiflow.py --model-path /path/to/model.pt --data-dir /path/to/test/samples -g 0
 """
 
 import os
@@ -63,8 +66,16 @@ def setup_and_import(args):
 # Model loading
 # ======================================================================
 
-def load_model(model_dir, device):
-    """Load trained OptiFlow model from directory."""
+def load_model(model_dir, device, model_path=None):
+    """Load trained OptiFlow model.
+
+    Args:
+        model_dir: Directory containing config.json (and optionally best_model.pt).
+        device: Torch device string.
+        model_path: If given, load weights from this .pt file instead of
+                     model_dir/best_model.pt.  The config.json is looked up in
+                     the same directory as model_path first, then model_dir.
+    """
     from model.graph_init import GraphInitialization
     from model.adaptive_slicing import AdaptiveSlicing
     from model.latent_evolution import LatentTrajectoryEvolution
@@ -73,11 +84,20 @@ def load_model(model_dir, device):
     # We import the class from training script
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-    config_path = model_dir / 'config.json'
-    if config_path.exists():
-        with open(config_path) as f:
-            config = json.load(f)
-    else:
+    # Determine config.json location
+    config = None
+    search_dirs = []
+    if model_path is not None:
+        search_dirs.append(pathlib.Path(model_path).parent)
+    if model_dir is not None:
+        search_dirs.append(model_dir)
+    for d in search_dirs:
+        cfg = d / 'config.json'
+        if cfg.exists():
+            with open(cfg) as f:
+                config = json.load(f)
+            break
+    if config is None:
         # Default config
         config = {
             'cons_nfeats': 5, 'var_nfeats': 23,
@@ -99,12 +119,19 @@ def load_model(model_dir, device):
         dropout=0.0,  # no dropout at inference
     ).to(device)
 
-    model_path = model_dir / 'best_model.pt'
-    if model_path.exists():
-        model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
-        print(f"Loaded model from {model_path}")
+    # Determine which weights file to load
+    if model_path is not None:
+        weights_path = pathlib.Path(model_path)
+    elif model_dir is not None:
+        weights_path = model_dir / 'best_model.pt'
     else:
-        print(f"WARNING: No model weights found at {model_path}")
+        weights_path = None
+
+    if weights_path is not None and weights_path.exists():
+        model.load_state_dict(torch.load(weights_path, map_location=device, weights_only=True))
+        print(f"Loaded model from {weights_path}")
+    else:
+        print(f"WARNING: No model weights found at {weights_path}")
         print("  Running with random weights (for testing pipeline only)")
 
     model.eval()
@@ -278,12 +305,20 @@ def load_baseline_results(data_dir, solver_name):
 
 def evaluate_solver_handoff(model, data_dir, instance_dir, device,
                             solver_name='gurobi', time_limit=60,
-                            verbose=False):
+                            e2e_time_limit=None, verbose=False):
     """
     Evaluate solver handoff: model predictions → fix variables → solve.
 
     Compares against pre-computed baseline results from baseline_results_{solver}.csv
     (produced by 04_evaluate_baseline.py).  Run that script first.
+
+    Parameters
+    ----------
+    e2e_time_limit : float or None
+        If set, caps the total per-sample wall time (infer + fixing + solver).
+        The solver time limit is dynamically reduced so that the total does not
+        exceed this budget.  Samples that already exceed the budget after
+        inference are marked as 'e2e_timelimit'.
     """
     import re
     from model.deslicing_decoder import extract_var_types
@@ -303,8 +338,13 @@ def evaluate_solver_handoff(model, data_dir, instance_dir, device,
 
     print(f"\n{'='*60}")
     print(f"Solver Handoff Evaluation — {len(test_files)} samples")
-    print(f"Solver: {solver_name}, Time limit: {time_limit}s")
-    print(f"Note: handoff time = model inference + {solver_name} post-processing")
+    if e2e_time_limit is not None:
+        print(f"Solver: {solver_name}, E2E time limit: {e2e_time_limit}s "
+              f"(solver time dynamically adjusted)")
+    else:
+        print(f"Solver: {solver_name}, Solver time limit: {time_limit}s")
+    print(f"Baseline: read from pre-computed CSV (if available)")
+    print(f"Note: handoff time = model inference + fixing + {solver_name} solving")
     print(f"{'='*60}")
 
     solver = TrustRegionSolver(
@@ -328,16 +368,52 @@ def evaluate_solver_handoff(model, data_dir, instance_dir, device,
                   'status_baseline', 'status_handoff',
                   'improvement_pct']
 
+    # ---- Resume: load already-completed instances from existing CSV ----
+    done_instances = set()
+    if os.path.exists(results_csv):
+        with open(results_csv, newline='') as f:
+            for row in csv.DictReader(f):
+                done_instances.add(row['instance'])
+        if done_instances:
+            print(f"  [RESUME] Found {len(done_instances)} already-completed "
+                  f"instances in {results_csv}, skipping them.")
+
     # Accumulators for summary statistics
     times_base, times_e2e = [], []
     times_prep, times_infer, times_fixing, times_solver_hand = [], [], [], []
     objs_base, objs_hand = [], []
     statuses_base, statuses_hand = [], []
     n_skipped = 0
+    n_resumed = 0
 
-    with open(results_csv, 'w', newline='') as csvfile:
+    # Re-load stats from completed instances for summary
+    if done_instances and os.path.exists(results_csv):
+        with open(results_csv, newline='') as f:
+            for row in csv.DictReader(f):
+                try:
+                    times_e2e.append(float(row['time_e2e']))
+                    times_prep.append(float(row['time_prep']))
+                    times_infer.append(float(row['time_infer']))
+                    times_fixing.append(float(row['time_fixing']))
+                    times_solver_hand.append(float(row['time_solver']))
+                    if row['time_baseline'] not in ('', 'N/A', 'None'):
+                        times_base.append(float(row['time_baseline']))
+                    if row['status_baseline'] != 'N/A':
+                        statuses_base.append(row['status_baseline'])
+                    statuses_hand.append(row['status_handoff'])
+                    if row['obj_baseline'] not in ('', 'None', 'N/A'):
+                        objs_base.append(float(row['obj_baseline']))
+                    if row['obj_handoff'] not in ('', 'None', 'N/A'):
+                        objs_hand.append(float(row['obj_handoff']))
+                    n_resumed += 1
+                except (ValueError, KeyError):
+                    pass
+
+    write_header = not bool(done_instances)
+    with open(results_csv, 'a' if done_instances else 'w', newline='') as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
+        if write_header:
+            writer.writeheader()
 
         for i, test_file in enumerate(test_files):
             with gzip.open(test_file, 'rb') as f:
@@ -350,6 +426,11 @@ def evaluate_solver_handoff(model, data_dir, instance_dir, device,
                 continue
 
             instance_name = os.path.basename(instance_path)
+
+            # Skip already-completed instances (resume support)
+            if instance_name in done_instances:
+                print(f"  [CACHED] Sample {i+1}: {instance_name} (already done)", flush=True)
+                continue
 
             # Get variable names
             sol_info = sample_data.get('solution', {})
@@ -380,28 +461,47 @@ def evaluate_solver_handoff(model, data_dir, instance_dir, device,
                 obj_base, time_base, status_base = None, None, 'N/A'
 
             # ---- Handoff: model inference + solver with fixings ----
-            t_infer_start = time.time()
+            t_e2e_start = time.time()
             with torch.no_grad():
                 result, var_types, _, _, _ = model(
                     cons_feats, edge_idx, edge_vals, var_feats,
                     var_batch=var_batch,
                 )
-            time_infer = time.time() - t_infer_start
+            time_infer = time.time() - t_e2e_start
 
-            t_fix_start = time.time()
-            try:
-                sol_hand, status_hand, obj_hand, info_hand = \
-                    solver.backtracking_solve(
-                        instance_path, result, n_vars, var_types,
-                        var_names=var_names, use_mip_start=True,
-                    )
-                time_solver_h = info_hand.get('solving_time', 0.0)
-                time_fixing = (time.time() - t_fix_start) - time_solver_h
-                time_e2e = time_infer + time_fixing + time_solver_h
-            except Exception as e:
-                print(f"  [ERROR] Sample {i+1}: handoff solver error: {e}", flush=True)
-                n_skipped += 1
-                continue
+            # Check e2e budget after inference
+            if e2e_time_limit is not None and time_infer >= e2e_time_limit:
+                # Inference alone already exceeded the budget
+                time_fixing = 0.0
+                time_solver_h = 0.0
+                time_e2e = time_infer
+                sol_hand, status_hand, obj_hand = None, 'e2e_timelimit', None
+                info_hand = {'n_fixed': 0, 'backtrack_step': 0,
+                             'solving_time': 0.0}
+                print(f"  [TIMEOUT] Sample {i+1}: inference ({time_infer:.2f}s) "
+                      f"exceeded e2e limit ({e2e_time_limit}s)", flush=True)
+            else:
+                # Dynamically cap solver time to remaining e2e budget
+                if e2e_time_limit is not None:
+                    remaining = e2e_time_limit - (time.time() - t_e2e_start)
+                    solver.time_limit = max(remaining, 0.1)
+                else:
+                    solver.time_limit = time_limit
+
+                t_fix_start = time.time()
+                try:
+                    sol_hand, status_hand, obj_hand, info_hand = \
+                        solver.backtracking_solve(
+                            instance_path, result, n_vars, var_types,
+                            var_names=var_names, use_mip_start=True,
+                        )
+                    time_solver_h = info_hand.get('solving_time', 0.0)
+                    time_fixing = (time.time() - t_fix_start) - time_solver_h
+                    time_e2e = time.time() - t_e2e_start
+                except Exception as e:
+                    print(f"  [ERROR] Sample {i+1}: handoff solver error: {e}", flush=True)
+                    n_skipped += 1
+                    continue
 
             # ---- Compare ----
             improvement = 0.0
@@ -470,7 +570,7 @@ def evaluate_solver_handoff(model, data_dir, instance_dir, device,
     # ---- Summary statistics ----
     n_done = len(times_e2e)
     print(f"\n{'='*70}")
-    print(f"Summary ({n_done} solved, {n_skipped} skipped, time_limit={time_limit}s)")
+    print(f"Summary ({n_done} solved, {n_resumed} resumed, {n_skipped} skipped, time_limit={time_limit}s)")
     print(f"{'='*70}")
 
     if not times_e2e:
@@ -529,8 +629,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description='Evaluate OptiFlow model.')
     parser.add_argument(
-        'problem',
+        'problem', nargs='?', default=None,
         choices=['setcover', 'cauctions', 'facilities', 'indset', 'mknapsack'],
+        help='Problem type. Required when --model-path and --data-dir are not both given.',
     )
     parser.add_argument('-s', '--seed', type=int, default=0)
     parser.add_argument('-g', '--gpu', type=int, default=0)
@@ -544,8 +645,24 @@ if __name__ == "__main__":
     )
     parser.add_argument('--time-limit', type=float, default=300,
                         help='Solver time limit in seconds (default: 300).')
+    parser.add_argument('--e2e-time-limit', type=float, default=None,
+                        help='End-to-end per-sample time limit in seconds '
+                             '(infer + fixing + solver). If set, the solver '
+                             'time limit is dynamically reduced to fit within '
+                             'this budget. Default: None (no e2e limit).')
+    parser.add_argument('--model-path', type=str, default=None,
+                        help='Path to model weights (.pt file). '
+                             'Overrides the default model directory.')
+    parser.add_argument('--data-dir', type=str, default=None,
+                        help='Path to test dataset directory (containing sample_*.pkl). '
+                             'Overrides the default data directory.')
     parser.add_argument('--verbose', action='store_true')
     args = parser.parse_args()
+
+    # Validate: need either problem or both --model-path and --data-dir
+    if args.problem is None and (args.model_path is None or args.data_dir is None):
+        parser.error('Either specify a problem type, or provide both '
+                     '--model-path and --data-dir.')
 
     device = setup_and_import(args)
 
@@ -558,26 +675,43 @@ if __name__ == "__main__":
         'mknapsack': 'mknapsack/100_6',
     }
 
-    model_dir = pathlib.Path(
-        f'trained_models/optiflow/{args.problem}/{args.seed}')
-    data_dir = pathlib.Path('data/samples') / problem_folders[args.problem]
+    # Model path
+    model_pt = None
+    model_dir = None
+    if args.model_path is not None:
+        model_pt = pathlib.Path(args.model_path)
+        if not model_pt.exists():
+            print(f"ERROR: model file not found: {model_pt}")
+            sys.exit(1)
+        model_dir = model_pt.parent
+    elif args.problem is not None:
+        model_dir = pathlib.Path(
+            f'trained_models/optiflow/{args.problem}/{args.seed}')
 
-    # Prefer test set, fall back to valid, then train
-    for split in ('test', 'valid', 'train'):
-        test_data_dir = data_dir / split
-        if test_data_dir.exists() and list(test_data_dir.glob('sample_*.pkl')):
-            break
-    else:
-        print(f"No data found in {data_dir}")
-        sys.exit(1)
+    # Data directory
+    if args.data_dir is not None:
+        test_data_dir = pathlib.Path(args.data_dir)
+        if not test_data_dir.exists():
+            print(f"ERROR: data directory not found: {test_data_dir}")
+            sys.exit(1)
+    elif args.problem is not None:
+        data_dir = pathlib.Path('data/samples') / problem_folders[args.problem]
+        # Prefer test set, fall back to valid, then train
+        for split in ('test', 'valid', 'train'):
+            test_data_dir = data_dir / split
+            if test_data_dir.exists() and list(test_data_dir.glob('sample_*.pkl')):
+                break
+        else:
+            print(f"No data found in {data_dir}")
+            sys.exit(1)
 
-    print(f"Problem: {args.problem}")
-    print(f"Model dir: {model_dir}")
+    print(f"Problem: {args.problem or 'N/A'}")
+    print(f"Model: {model_pt or model_dir}")
     print(f"Data dir: {test_data_dir}")
     print(f"Device: {device}")
 
     # ---- Load model ----
-    model, config = load_model(model_dir, device)
+    model, config = load_model(model_dir, device, model_path=model_pt)
 
     # ---- Evaluate ----
     if args.mode in ('predict', 'both'):
@@ -585,10 +719,14 @@ if __name__ == "__main__":
                              verbose=args.verbose)
 
     if args.mode in ('solve', 'both'):
-        instance_dir = pathlib.Path('data/instances') / args.problem
+        if args.problem is not None:
+            instance_dir = pathlib.Path('data/instances') / args.problem
+        else:
+            instance_dir = test_data_dir  # fallback
         evaluate_solver_handoff(
             model, test_data_dir, instance_dir, device,
             solver_name=args.solver,
             time_limit=args.time_limit,
+            e2e_time_limit=args.e2e_time_limit,
             verbose=args.verbose,
         )

@@ -261,10 +261,9 @@ class DeslicingDecoder(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-        # Binary decoder output bias: slight negative prior
-        # (most binary variables are 0 in MILP)
+        # Binary decoder output bias: no prior (neutral initialization)
         with torch.no_grad():
-            self.bin_decoder.head.bias.fill_(-0.5)
+            self.bin_decoder.head.bias.fill_(0.0)
 
     def forward(self, evolved_tokens, token_batch, attn_weights,
                 var_types, z_var_0=None, var_batch=None,
