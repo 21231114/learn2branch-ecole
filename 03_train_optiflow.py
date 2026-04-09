@@ -20,6 +20,7 @@ Usage:
     python 03_train_optiflow.py setcover -g 0
     python 03_train_optiflow.py setcover -g -1   # CPU
     python 03_train_optiflow.py mknapsack --epochs 200 --batch-size 16
+    python 03_train_optiflow.py SC --data-dir /path/to/samples -g 0  # auto-split 240/60
 """
 
 import os
@@ -399,6 +400,13 @@ if __name__ == "__main__":
                         help='Early stopping patience.')
     parser.add_argument('--loss-type', choices=['focal', 'bce'], default='focal',
                         help='Binary loss type: "focal" (default) or "bce".')
+    parser.add_argument('--data-dir', type=str, default=None,
+                        help='Custom data directory. All sample_*.pkl inside '
+                             'will be auto-split into train/valid by seed.')
+    parser.add_argument('--n-train', type=int, default=240,
+                        help='Number of training samples when auto-splitting (default: 240).')
+    parser.add_argument('--n-valid', type=int, default=60,
+                        help='Number of validation samples when auto-splitting (default: 60).')
     args = parser.parse_args()
 
     # ---- Device ----
@@ -422,19 +430,49 @@ if __name__ == "__main__":
         'mknapsack': 'mknapsack/100_6',
         'SC': 'SC',
     }
-    data_dir = pathlib.Path('data/samples') / problem_folders[args.problem]
+
+    if args.data_dir is not None:
+        data_dir = pathlib.Path(args.data_dir)
+    else:
+        data_dir = pathlib.Path('data/samples') / problem_folders[args.problem]
+
     run_dir = pathlib.Path(f'trained_models/optiflow/{args.problem}/{args.seed}')
     run_dir.mkdir(parents=True, exist_ok=True)
     logfile = str(run_dir / 'train_log.txt')
 
     # ---- Data ----
-    train_files = sorted(str(f) for f in (data_dir / 'train').glob('sample_*.pkl'))
-    valid_files = sorted(str(f) for f in (data_dir / 'valid').glob('sample_*.pkl'))
+    if args.data_dir is not None:
+        # Auto-split mode: collect all sample_*.pkl from the directory (and subdirs)
+        all_files = sorted(str(f) for f in data_dir.rglob('sample_*.pkl'))
+        if not all_files:
+            print(f"ERROR: No sample_*.pkl found in {data_dir}")
+            sys.exit(1)
 
-    if not train_files:
-        print(f"ERROR: No training data found in {data_dir / 'train'}")
-        print("Run 02_generate_dataset.py first.")
-        sys.exit(1)
+        n_total = len(all_files)
+        n_train = args.n_train
+        n_valid = args.n_valid
+
+        if n_train + n_valid > n_total:
+            print(f"ERROR: Requested {n_train} train + {n_valid} valid = "
+                  f"{n_train + n_valid}, but only {n_total} files found.")
+            sys.exit(1)
+
+        # Shuffle with seed and split
+        rng = np.random.RandomState(args.seed)
+        indices = rng.permutation(n_total)
+        train_files = [all_files[i] for i in indices[:n_train]]
+        valid_files = [all_files[i] for i in indices[n_train:n_train + n_valid]]
+
+        log(f"Auto-split from {data_dir}: {n_total} total -> "
+            f"{len(train_files)} train, {len(valid_files)} valid (seed={args.seed})", logfile)
+    else:
+        train_files = sorted(str(f) for f in (data_dir / 'train').glob('sample_*.pkl'))
+        valid_files = sorted(str(f) for f in (data_dir / 'valid').glob('sample_*.pkl'))
+
+        if not train_files:
+            print(f"ERROR: No training data found in {data_dir / 'train'}")
+            print("Run 02_generate_dataset.py first.")
+            sys.exit(1)
 
     log(f"Train files: {len(train_files)}", logfile)
     log(f"Valid files: {len(valid_files)}", logfile)

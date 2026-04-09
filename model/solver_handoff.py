@@ -43,7 +43,8 @@ class TrustRegionSolver:
 
     def __init__(self, threshold_high=0.95, threshold_low=0.05,
                  int_confidence=0.90, max_backtrack_steps=4,
-                 solver='gurobi', time_limit=60, threads=1, verbose=False):
+                 solver='gurobi', time_limit=60, threads=1, verbose=False,
+                 trust_region_delta=None):
         """
         Parameters
         ----------
@@ -65,6 +66,14 @@ class TrustRegionSolver:
             Number of solver threads.
         verbose : bool
             If True, print solver output.
+        trust_region_delta : int or None
+            If set, use CoCo-MILP-style soft trust region constraints instead
+            of hard variable fixings.  For each candidate variable i with
+            model prediction x_star_i, an auxiliary variable alpha_i is added
+            satisfying alpha_i >= |x_i - x_star_i|, and the constraint
+            sum(alpha_i) <= trust_region_delta is enforced.  This allows the
+            solver to deviate from the model prediction by at most delta total
+            Hamming distance.  When None (default), hard fixing is used.
         """
         self.threshold_high = threshold_high
         self.threshold_low = threshold_low
@@ -74,6 +83,7 @@ class TrustRegionSolver:
         self.time_limit = time_limit
         self.threads = threads
         self.verbose = verbose
+        self.trust_region_delta = trust_region_delta
 
     # ------------------------------------------------------------------
     # Fixing extraction
@@ -189,7 +199,7 @@ class TrustRegionSolver:
     # ------------------------------------------------------------------
 
     def _solve_gurobi(self, instance_path, fixings_dict, var_names=None,
-                      mip_start_dict=None):
+                      mip_start_dict=None, ref_obj=None):
         """
         Solve a MILP instance with Gurobi, applying variable fixings.
 
@@ -204,6 +214,9 @@ class TrustRegionSolver:
             Gurobi variable order is used.
         mip_start_dict : dict, optional
             Maps variable index -> start value (MIP Start).
+        ref_obj : float, optional
+            Reference objective value (e.g. from Gurobi 3600s solution)
+            for computing gap at each new incumbent.
 
         Returns
         -------
@@ -213,7 +226,7 @@ class TrustRegionSolver:
             'optimal', 'feasible', 'infeasible', 'timelimit', etc.
         obj_val : float or None
         info : dict
-            Additional info (solving_time, n_nodes, n_fixed).
+            Additional info (solving_time, n_nodes, n_fixed, iteration_log).
         """
         import gurobipy as gp
         from gurobipy import GRB
@@ -224,6 +237,21 @@ class TrustRegionSolver:
         model = gp.read(instance_path, env)
         model.setParam('TimeLimit', self.time_limit)
         model.setParam('Threads', self.threads)
+        model.setParam('MIPFocus', 1)
+
+        # Callback to record objective value and gap at each new incumbent
+        iteration_log = []
+
+        def _callback(m, where):
+            if where == GRB.Callback.MIPSOL:
+                cur_time = m.cbGet(GRB.Callback.RUNTIME)
+                cur_obj = m.cbGet(GRB.Callback.MIPSOL_OBJ)
+                entry = {'time': cur_time, 'obj': cur_obj}
+                if ref_obj is not None and ref_obj != 0:
+                    entry['gap_to_ref'] = abs(cur_obj - ref_obj) / max(abs(ref_obj), 1e-10)
+                elif ref_obj is not None:
+                    entry['gap_to_ref'] = abs(cur_obj - ref_obj)
+                iteration_log.append(entry)
 
         grb_vars = model.getVars()
 
@@ -243,14 +271,39 @@ class TrustRegionSolver:
         else:
             index_to_grb = {i: v for i, v in enumerate(grb_vars)}
 
-        # ---- Apply fixings (tighten bounds) ----
+        # ---- Apply fixings or trust region soft constraints ----
         n_fixed = 0
-        for idx, val in fixings_dict.items():
-            if idx in index_to_grb:
-                v = index_to_grb[idx]
-                v.LB = val
-                v.UB = val
+        if self.trust_region_delta is not None:
+            # CoCo-MILP-style soft trust region:
+            # For each candidate variable i with prediction x_star_i, add
+            #   alpha_i >= x_i - x_star_i
+            #   alpha_i >= x_star_i - x_i
+            #   alpha_i >= 0
+            # and the global constraint sum(alpha_i) <= trust_region_delta.
+            alphas = []
+            for idx, val in fixings_dict.items():
+                if idx not in index_to_grb:
+                    continue
+                tar_var = index_to_grb[idx]
+                alpha = model.addVar(lb=0.0, name=f'_tr_alpha_{idx}')
+                model.addConstr(alpha >= tar_var - val, name=f'_tr_up_{idx}')
+                model.addConstr(alpha >= val - tar_var, name=f'_tr_dn_{idx}')
+                alphas.append(alpha)
                 n_fixed += 1
+            if alphas:
+                model.addConstr(
+                    sum(alphas) <= self.trust_region_delta,
+                    name='_tr_budget'
+                )
+            model.update()
+        else:
+            # Hard fixing: tighten variable bounds
+            for idx, val in fixings_dict.items():
+                if idx in index_to_grb:
+                    v = index_to_grb[idx]
+                    v.LB = val
+                    v.UB = val
+                    n_fixed += 1
 
         # ---- MIP Start ----
         if mip_start_dict:
@@ -258,7 +311,7 @@ class TrustRegionSolver:
                 if idx in index_to_grb:
                     index_to_grb[idx].Start = val
 
-        model.optimize()
+        model.optimize(_callback)
 
         status_map = {
             GRB.OPTIMAL: 'optimal',
@@ -274,6 +327,7 @@ class TrustRegionSolver:
             'n_nodes': int(model.NodeCount) if hasattr(model, 'NodeCount') else 0,
             'n_fixed': n_fixed,
             'n_total_vars': len(grb_vars),
+            'iteration_log': iteration_log,
         }
 
         if model.SolCount > 0:
@@ -329,13 +383,36 @@ class TrustRegionSolver:
         else:
             index_to_scip = {i: v for i, v in enumerate(scip_vars)}
 
-        # ---- Apply fixings ----
+        # ---- Apply fixings or trust region soft constraints ----
         n_fixed = 0
-        for idx, val in fixings_dict.items():
-            if idx in index_to_scip:
-                v = index_to_scip[idx]
-                model.fixVar(v, val)
+        if self.trust_region_delta is not None:
+            # CoCo-MILP-style soft trust region via SCIP auxiliary variables.
+            # For each candidate variable i with prediction x_star_i:
+            #   alpha_i >= x_i - x_star_i,  alpha_i >= x_star_i - x_i
+            # and sum(alpha_i) <= trust_region_delta.
+            from pyscipopt import quicksum
+            alphas = []
+            for idx, val in fixings_dict.items():
+                if idx not in index_to_scip:
+                    continue
+                tar_var = index_to_scip[idx]
+                alpha = model.addVar(lb=0.0, name=f'_tr_alpha_{idx}')
+                model.addCons(alpha >= tar_var - val, name=f'_tr_up_{idx}')
+                model.addCons(alpha >= val - tar_var, name=f'_tr_dn_{idx}')
+                alphas.append(alpha)
                 n_fixed += 1
+            if alphas:
+                model.addCons(
+                    quicksum(alphas) <= self.trust_region_delta,
+                    name='_tr_budget'
+                )
+        else:
+            # Hard fixing
+            for idx, val in fixings_dict.items():
+                if idx in index_to_scip:
+                    v = index_to_scip[idx]
+                    model.fixVar(v, val)
+                    n_fixed += 1
 
         # ---- MIP Start (SCIP partial solution) ----
         if mip_start_dict:
@@ -378,11 +455,12 @@ class TrustRegionSolver:
     # ------------------------------------------------------------------
 
     def _solve(self, instance_path, fixings_dict, var_names=None,
-               mip_start_dict=None):
+               mip_start_dict=None, ref_obj=None):
         """Route to Gurobi or SCIP based on self.solver."""
         if self.solver == 'gurobi':
             return self._solve_gurobi(
-                instance_path, fixings_dict, var_names, mip_start_dict)
+                instance_path, fixings_dict, var_names, mip_start_dict,
+                ref_obj=ref_obj)
         elif self.solver == 'scip':
             return self._solve_scip(
                 instance_path, fixings_dict, var_names, mip_start_dict)
@@ -394,7 +472,7 @@ class TrustRegionSolver:
     # ------------------------------------------------------------------
 
     def solve_with_fixings(self, instance_path, result, n_vars, var_types,
-                           var_names=None, use_mip_start=False):
+                           var_names=None, use_mip_start=False, ref_obj=None):
         """
         One-shot solve: extract fixings from predictions and solve.
 
@@ -412,6 +490,8 @@ class TrustRegionSolver:
             Variable names (matching solver's variable ordering).
         use_mip_start : bool
             If True, also inject full prediction as MIP Start.
+        ref_obj : float, optional
+            Reference objective value for gap tracking.
 
         Returns
         -------
@@ -427,10 +507,11 @@ class TrustRegionSolver:
         if use_mip_start:
             mip_start = self.get_full_prediction(result, n_vars)
 
-        return self._solve(instance_path, fixings_dict, var_names, mip_start)
+        return self._solve(instance_path, fixings_dict, var_names, mip_start,
+                           ref_obj=ref_obj)
 
     def backtracking_solve(self, instance_path, result, n_vars, var_types,
-                           var_names=None, use_mip_start=True):
+                           var_names=None, use_mip_start=True, ref_obj=None):
         """
         Solve with automatic backtracking on infeasibility.
 
@@ -455,6 +536,8 @@ class TrustRegionSolver:
             Variable names.
         use_mip_start : bool
             Inject full prediction as MIP Start.
+        ref_obj : float, optional
+            Reference objective value for gap tracking.
 
         Returns
         -------
@@ -462,7 +545,8 @@ class TrustRegionSolver:
         status : str
         obj_val : float or None
         info : dict
-            Includes 'n_fixed', 'backtrack_step', 'total_candidates'.
+            Includes 'n_fixed', 'backtrack_step', 'total_candidates',
+            'iteration_log'.
         """
         # Extract all candidate fixings sorted by confidence
         all_fixings = self.extract_fixings(result, n_vars, var_types)
@@ -487,7 +571,8 @@ class TrustRegionSolver:
             fixings_dict = {idx: val for idx, (val, _) in top_fixings}
 
             sol, status, obj, info = self._solve(
-                instance_path, fixings_dict, var_names, mip_start)
+                instance_path, fixings_dict, var_names, mip_start,
+                ref_obj=ref_obj)
 
             info['backtrack_step'] = step
             info['total_candidates'] = total_candidates
@@ -504,7 +589,7 @@ class TrustRegionSolver:
 
         # ---- Final fallback: no fixings, only MIP Start ----
         sol, status, obj, info = self._solve(
-            instance_path, {}, var_names, mip_start)
+            instance_path, {}, var_names, mip_start, ref_obj=ref_obj)
         info['backtrack_step'] = self.max_backtrack_steps
         info['total_candidates'] = total_candidates
         return sol, status, obj, info

@@ -40,7 +40,18 @@ def solve_gurobi(instance_path, time_limit, verbose=False):
     model = gp.read(instance_path, env)
     model.setParam('TimeLimit', time_limit)
     model.setParam('Threads', 1)
-    model.optimize()
+    model.setParam('MIPFocus', 1)
+
+    # Callback: record (time, obj) at each new incumbent; gap computed post-hoc
+    iteration_log = []
+
+    def _callback(m, where):
+        if where == GRB.Callback.MIPSOL:
+            cur_time = m.cbGet(GRB.Callback.RUNTIME)
+            cur_obj = m.cbGet(GRB.Callback.MIPSOL_OBJ)
+            iteration_log.append({'time': cur_time, 'obj': cur_obj})
+
+    model.optimize(_callback)
 
     status_map = {
         GRB.OPTIMAL:   'optimal',
@@ -54,6 +65,7 @@ def solve_gurobi(instance_path, time_limit, verbose=False):
     info = {
         'solving_time': model.Runtime,
         'n_nodes': int(model.NodeCount) if hasattr(model, 'NodeCount') else 0,
+        'iteration_log': iteration_log,
     }
 
     if model.SolCount > 0:
@@ -95,14 +107,21 @@ def solve_scip(instance_path, time_limit, verbose=False):
     }
     status = status_map.get(scip_status, scip_status)
 
+    iteration_log = []
+
     info = {
         'solving_time': model.getSolvingTime(),
         'n_nodes': model.getNNodes(),
+        'iteration_log': iteration_log,
     }
 
     if model.getNSols() > 0:
         best_sol = model.getBestSol()
         obj_val = model.getSolObjVal(best_sol)
+        iteration_log.append({
+            'time': model.getSolvingTime(),
+            'obj': obj_val,
+        })
         if status == 'timelimit':
             status = 'timelimit*'
         info['feasible'] = True
@@ -129,7 +148,8 @@ def solve_instance(instance_path, solver_name, time_limit, verbose=False):
 # Main evaluation
 # ======================================================================
 
-def evaluate_baseline(data_dir, solver_name, time_limit, verbose, logfile):
+def evaluate_baseline(data_dir, solver_name, time_limit, verbose, logfile,
+                      trajectory_time=1000):
     def _numeric_key(path):
         nums = re.findall(r'\d+', os.path.basename(path))
         return int(nums[-1]) if nums else 0
@@ -144,13 +164,15 @@ def evaluate_baseline(data_dir, solver_name, time_limit, verbose, logfile):
 
     log(f"{'='*60}", logfile)
     log(f"Baseline Evaluation — {len(test_files)} samples", logfile)
-    log(f"Solver: {solver_name}, Time limit: {time_limit}s", logfile)
+    log(f"Solver: {solver_name}, Time limit: {time_limit}s, "
+        f"Trajectory time: {trajectory_time}s", logfile)
     log(f"{'='*60}", logfile)
 
     results_csv = str(data_dir.parent / f'baseline_results_{solver_name}.csv')
     fieldnames = [
         'sample', 'instance', 'n_vars',
-        'obj_baseline', 'time_baseline',
+        'obj_baseline', 'obj_at_trajectory', 'gap_at_trajectory',
+        'time_baseline',
         'status_baseline', 'mip_gap', 'feasible', 'max_violation',
     ]
 
@@ -200,16 +222,58 @@ def evaluate_baseline(data_dir, solver_name, time_limit, verbose, logfile):
                 n_skipped += 1
                 continue
 
+            # ref_obj = final objective after full solve (e.g. 3600s)
+            ref_obj = obj
+
+            # Post-hoc: compute gap_to_ref for trajectory within trajectory_time,
+            # using the final obj as reference
+            obj_at_traj = None
+            gap_at_traj = None
+            iteration_log = info.get('iteration_log', [])
+            if iteration_log and ref_obj is not None:
+                trajectory = []
+                for entry in iteration_log:
+                    if entry['time'] <= trajectory_time:
+                        gap = (abs(entry['obj'] - ref_obj) / max(abs(ref_obj), 1e-10)
+                               if ref_obj != 0
+                               else abs(entry['obj'] - ref_obj))
+                        trajectory.append({
+                            'time': entry['time'],
+                            'obj': entry['obj'],
+                            'gap_to_ref': gap,
+                        })
+
+                if trajectory:
+                    # Best incumbent at trajectory_time cutoff
+                    obj_at_traj = trajectory[-1]['obj']
+                    gap_at_traj = trajectory[-1]['gap_to_ref']
+
+                    iter_log_dir = data_dir.parent / f'baseline_iteration_logs_{solver_name}'
+                    iter_log_dir.mkdir(parents=True, exist_ok=True)
+                    inst_name = os.path.splitext(os.path.basename(instance_path))[0]
+                    iter_log_path = str(iter_log_dir / f'{inst_name}.json')
+                    with open(iter_log_path, 'w') as jf:
+                        json.dump({
+                            'instance': os.path.basename(instance_path),
+                            'ref_obj': ref_obj,
+                            'time_limit': time_limit,
+                            'trajectory_time': trajectory_time,
+                            'trajectory': trajectory,
+                        }, jf, indent=2)
+
             gap_str = (f"{info['mip_gap']:.4f}"
                        if info.get('mip_gap') is not None else 'N/A')
             viol_str = (f"{info['max_violation']:.2e}"
                         if info.get('max_violation') is not None else 'N/A')
+            gap_traj_str = (f"{gap_at_traj:.6f}"
+                            if gap_at_traj is not None else 'N/A')
 
             print(f"[{i+1:4d}/{len(test_files)}] {os.path.basename(instance_path)}"
                   f"  vars={n_vars}"
-                  f"  obj={obj}  t={solving_time:.2f}s"
-                  f"  status={status}  gap={gap_str}"
-                  f"  feasible={info.get('feasible')}  max_viol={viol_str}",
+                  f"  obj_3600s={obj}  obj_{int(trajectory_time)}s={obj_at_traj}"
+                  f"  gap_{int(trajectory_time)}s={gap_traj_str}"
+                  f"  t={solving_time:.2f}s"
+                  f"  status={status}  mip_gap={gap_str}",
                   flush=True)
 
             row = {
@@ -217,6 +281,8 @@ def evaluate_baseline(data_dir, solver_name, time_limit, verbose, logfile):
                 'instance': os.path.basename(instance_path),
                 'n_vars': n_vars,
                 'obj_baseline': obj,
+                'obj_at_trajectory': obj_at_traj,
+                'gap_at_trajectory': gap_at_traj,
                 'time_baseline': f"{solving_time:.3f}",
                 'status_baseline': status,
                 'mip_gap': info.get('mip_gap'),
@@ -276,6 +342,9 @@ if __name__ == '__main__':
     )
     parser.add_argument('--time-limit', type=float, default=300,
                         help='Solver time limit in seconds (default: 300).')
+    parser.add_argument('--trajectory-time', type=float, default=1000,
+                        help='Record solving trajectory within this time (default: 1000s). '
+                             'Gap is computed post-hoc using the final objective as reference.')
     parser.add_argument('--verbose', action='store_true')
     args = parser.parse_args()
 
@@ -287,7 +356,8 @@ if __name__ == '__main__':
     logfile = str(test_data_dir.parent / 'baseline_eval_log.txt')
 
     log(f"Data dir: {test_data_dir}", logfile)
-    log(f"Solver  : {args.solver}, time limit: {args.time_limit}s", logfile)
+    log(f"Solver  : {args.solver}, time limit: {args.time_limit}s, "
+        f"trajectory time: {args.trajectory_time}s", logfile)
 
     evaluate_baseline(
         test_data_dir,
@@ -295,4 +365,5 @@ if __name__ == '__main__':
         time_limit=args.time_limit,
         verbose=args.verbose,
         logfile=logfile,
+        trajectory_time=args.trajectory_time,
     )

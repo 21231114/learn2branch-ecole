@@ -32,7 +32,7 @@ import numpy as np
 # Gurobi solver
 # ======================================================================
 
-def solve_gurobi(instance_path, time_limit, verbose=False):
+def solve_gurobi(instance_path, time_limit, verbose=False, ref_obj=None):
     import gurobipy as gp
     from gurobipy import GRB
 
@@ -42,7 +42,23 @@ def solve_gurobi(instance_path, time_limit, verbose=False):
     model = gp.read(instance_path, env)
     model.setParam('TimeLimit', time_limit)
     model.setParam('Threads', 1)
-    model.optimize()
+    model.setParam('MIPFocus', 1)
+
+    # Callback to record objective value and gap at each new incumbent
+    iteration_log = []
+
+    def _callback(m, where):
+        if where == GRB.Callback.MIPSOL:
+            cur_time = m.cbGet(GRB.Callback.RUNTIME)
+            cur_obj = m.cbGet(GRB.Callback.MIPSOL_OBJ)
+            entry = {'time': cur_time, 'obj': cur_obj}
+            if ref_obj is not None and ref_obj != 0:
+                entry['gap_to_ref'] = abs(cur_obj - ref_obj) / max(abs(ref_obj), 1e-10)
+            elif ref_obj is not None:
+                entry['gap_to_ref'] = abs(cur_obj - ref_obj)
+            iteration_log.append(entry)
+
+    model.optimize(_callback)
 
     status_map = {
         GRB.OPTIMAL:     'optimal',
@@ -56,6 +72,7 @@ def solve_gurobi(instance_path, time_limit, verbose=False):
     info = {
         'solving_time': model.Runtime,
         'n_nodes':      int(model.NodeCount),
+        'iteration_log': iteration_log,
     }
 
     if model.SolCount > 0:
@@ -110,7 +127,8 @@ def evaluate_transfer_set(data_dir: pathlib.Path, time_limit: float, verbose: bo
     results_csv = str(data_dir.parent / f'baseline_{data_dir.name}_gurobi.csv')
     fieldnames = [
         'sample', 'instance', 'n_vars',
-        'obj_baseline', 'time_baseline', 'n_nodes',
+        'obj_baseline', 'ref_obj', 'gap_to_ref',
+        'time_baseline', 'n_nodes',
         'status_baseline', 'mip_gap', 'feasible', 'max_violation',
     ]
 
@@ -135,9 +153,15 @@ def evaluate_transfer_set(data_dir: pathlib.Path, time_limit: float, verbose: bo
             _, _, var_feats = sample_data['observation']
             n_vars = len(var_feats)
 
+            # Extract reference objective value (Gurobi 3600s solution)
+            ref_obj = None
+            if 'solution' in sample_data and 'obj_val' in sample_data['solution']:
+                ref_obj = sample_data['solution']['obj_val']
+
             try:
                 t0 = time.time()
-                status, obj, info = solve_gurobi(instance_path, time_limit, verbose)
+                status, obj, info = solve_gurobi(instance_path, time_limit, verbose,
+                                                 ref_obj=ref_obj)
                 wall_time = time.time() - t0
                 solving_time = info.get('solving_time', wall_time)
             except Exception as e:
@@ -145,23 +169,51 @@ def evaluate_transfer_set(data_dir: pathlib.Path, time_limit: float, verbose: bo
                 n_skipped += 1
                 continue
 
+            # Compute final gap to reference
+            gap_to_ref = None
+            if obj is not None and ref_obj is not None:
+                if ref_obj != 0:
+                    gap_to_ref = abs(obj - ref_obj) / max(abs(ref_obj), 1e-10)
+                else:
+                    gap_to_ref = abs(obj - ref_obj)
+
             gap_str  = (f"{info['mip_gap']:.4f}"
                         if info.get('mip_gap') is not None else 'N/A')
             viol_str = (f"{info['max_violation']:.2e}"
                         if info.get('max_violation') is not None else 'N/A')
+            gap_ref_str = (f"{gap_to_ref:.6f}"
+                           if gap_to_ref is not None else 'N/A')
 
             print(f"  [{i+1:4d}/{len(test_files)}] {os.path.basename(instance_path)}"
                   f"  vars={n_vars}"
-                  f"  obj={obj}  t={solving_time:.2f}s"
+                  f"  obj={obj}  ref_obj={ref_obj}  gap_ref={gap_ref_str}"
+                  f"  t={solving_time:.2f}s"
                   f"  status={status}  gap={gap_str}"
                   f"  nodes={info.get('n_nodes',0)}  max_viol={viol_str}",
                   flush=True)
+
+            # Save per-instance iteration log (time, obj, gap at each incumbent)
+            iteration_log = info.get('iteration_log', [])
+            if iteration_log:
+                iter_log_dir = data_dir.parent / f'baseline_iteration_logs_gurobi'
+                iter_log_dir.mkdir(parents=True, exist_ok=True)
+                inst_name = os.path.splitext(os.path.basename(instance_path))[0]
+                iter_log_path = str(iter_log_dir / f'{inst_name}.json')
+                with open(iter_log_path, 'w') as jf:
+                    json.dump({
+                        'instance': os.path.basename(instance_path),
+                        'ref_obj': ref_obj,
+                        'time_limit': time_limit,
+                        'iterations': iteration_log,
+                    }, jf, indent=2)
 
             row = {
                 'sample':          i + 1,
                 'instance':        os.path.basename(instance_path),
                 'n_vars':          n_vars,
                 'obj_baseline':    obj,
+                'ref_obj':         ref_obj,
+                'gap_to_ref':      gap_to_ref,
                 'time_baseline':   f"{solving_time:.3f}",
                 'n_nodes':         info.get('n_nodes', 0),
                 'status_baseline': status,

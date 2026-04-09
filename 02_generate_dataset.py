@@ -398,6 +398,7 @@ def make_samples_gurobi(in_queue, out_queue, stop_flag, time_limit):
             grb_model.setParam('Seed', seed % (2**31))
             grb_model.setParam('TimeLimit', time_limit)
             grb_model.setParam('Threads', 1)
+            grb_model.setParam('MIPFocus', 1)
 
             grb_model.optimize()
 
