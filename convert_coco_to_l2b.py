@@ -96,28 +96,25 @@ def extract_observation(instance_path, seed):
     return root_observation, scip_var_names
 
 
-def load_coco_solution(sol_path):
+def load_coco_solution(sol_path, max_sols=50):
     """
     读取 CoCo-MILP 的 .sol 文件。
-    返回 (var_names, best_sol_values, best_obj)。
+    返回 (best_sol_dict, best_obj, all_sols_array, all_objs, var_names)。
     """
     with open(sol_path, 'rb') as f:
         data = pickle.load(f)
 
     var_names = data['var_names']
-    sols = np.array(data['sols'])
-    objs = np.array(data['objs'])
+    sols = np.array(data['sols'], dtype=np.float32)[:max_sols]
+    objs = np.array(data['objs'], dtype=np.float32)[:max_sols]
 
     # 取最优解 (第一个, objs 已按质量排序)
-    best_sol = sols[0]
     best_obj = float(objs[0])
 
-    # 构建 var_name -> value 映射
-    sol_dict = {}
-    for i, name in enumerate(var_names):
-        sol_dict[name] = float(best_sol[i])
+    # 构建最优解的 var_name -> value 映射
+    best_sol_dict = {name: float(sols[0, i]) for i, name in enumerate(var_names)}
 
-    return sol_dict, best_obj
+    return best_sol_dict, best_obj, sols, objs, var_names
 
 
 def map_solution_to_scip_vars(coco_sol_dict, scip_var_names):
@@ -155,12 +152,25 @@ def worker(in_queue, out_queue, stop_flag, coco_sol_dir, sol_prefix):
             # 1. ecole 提取观测
             root_observation, scip_var_names = extract_observation(instance_path, seed)
 
-            # 2. 读取 CoCo-MILP 解
+            # 2. 读取 CoCo-MILP 解 (包含全部50个解)
             sol_file = os.path.join(coco_sol_dir, f'{sol_prefix}{inst_num}.sol')
-            coco_sol_dict, best_obj = load_coco_solution(sol_file)
+            coco_sol_dict, best_obj, all_sols_array, all_objs, coco_var_names = load_coco_solution(sol_file)
 
-            # 3. 映射变量名
+            # 3. 映射变量名 (最优解)
             sol_vals = map_solution_to_scip_vars(coco_sol_dict, scip_var_names)
+
+            # 3b. 构建所有解的 numpy 数组, 按 scip 变量顺序排列
+            #     比 50 个 dict 紧凑得多, gzip 压缩快
+            n_sols = all_sols_array.shape[0]
+            n_vars = len(scip_var_names)
+            # 建立 coco 变量名 -> 索引 的映射
+            coco_name_to_idx = {name: i for i, name in enumerate(coco_var_names)}
+            multi_sols = np.zeros((n_sols, n_vars), dtype=np.float32)
+            for j, scip_name in enumerate(scip_var_names):
+                original_name = scip_name[2:] if scip_name.startswith('t_') else scip_name
+                idx = coco_name_to_idx.get(original_name)
+                if idx is not None:
+                    multi_sols[:, j] = all_sols_array[:, idx]
 
             # 4. 构造 solution_info (与 02_generate_dataset.py 格式一致)
             solution_info = {
@@ -171,6 +181,10 @@ def worker(in_queue, out_queue, stop_flag, coco_sol_dir, sol_prefix):
                 'dual_bound': None,
                 'solving_time': 3600.0,
                 'n_nodes': 0,
+                # 50 个可行解信息 (紧凑 numpy 数组格式)
+                'multi_sols': multi_sols,               # np.ndarray (n_sols, n_vars), 按 scip 变量顺序
+                'multi_objs': all_objs,                 # np.ndarray (n_sols,)
+                'n_sols': n_sols,                       # int, 解的数量
             }
 
             # 5. 保存

@@ -170,6 +170,109 @@ class SolutionGraphDataset(torch_geometric.data.Dataset):
         return graph
 
 
+class MultiSolutionGraphDataset(torch_geometric.data.Dataset):
+    """
+    Dataset that loads K feasible solutions per instance and computes
+    Boltzmann-weighted soft targets for training.
+
+    From the Boltzmann energy distribution perspective:
+        - Each solution k has objective (energy) f_k
+        - Boltzmann weight: w_k = softmax(-f̃_k / T)
+          where f̃_k = (f_k - μ) / σ is z-score normalized
+        - Soft target: x̄_j = Σ_k w_k · x_{k,j}
+
+    This is equivalent to minimizing KL(π_Boltzmann ∥ p_θ) —
+    the model learns a distribution biased toward better solutions
+    while benefiting from the diversity of all K solutions.
+
+    Parameters
+    ----------
+    sample_files : list[str]
+        Paths to .pkl sample files (gzipped).
+    temperature : float
+        Boltzmann temperature T.
+        T → 0: only best solution matters (hard label).
+        T → ∞: uniform average of all solutions.
+        Default 1.0 gives moderate weighting.
+    """
+    def __init__(self, sample_files, temperature=1.0):
+        super().__init__(root=None, transform=None, pre_transform=None)
+        self.sample_files = sample_files
+        self.temperature = temperature
+
+    def len(self):
+        return len(self.sample_files)
+
+    def get(self, index):
+        with gzip.open(self.sample_files[index], 'rb') as f:
+            sample = pickle.load(f)
+
+        constraint_features, (edge_indices, edge_values), variable_features = \
+            sample['observation']
+
+        constraint_features = torch.FloatTensor(
+            np.asarray(constraint_features, dtype=np.float32))
+        edge_indices = torch.LongTensor(
+            np.asarray(edge_indices, dtype=np.int64))
+        edge_features = torch.FloatTensor(
+            np.asarray(edge_values, dtype=np.float32)
+        ).unsqueeze(-1)
+        variable_features = torch.FloatTensor(
+            np.asarray(variable_features, dtype=np.float32))
+
+        n_vars = variable_features.shape[0]
+        solution = sample['solution']
+
+        multi_sols = solution.get('multi_sols')   # np.ndarray (n_sols, n_vars)
+        multi_objs = solution.get('multi_objs')   # np.ndarray or list (n_sols,)
+
+        if multi_sols is not None and len(multi_sols) > 0:
+            multi_sols_t = torch.FloatTensor(
+                np.asarray(multi_sols, dtype=np.float32))   # (K, n_vars)
+            multi_objs_t = torch.FloatTensor(
+                np.asarray(multi_objs, dtype=np.float32))   # (K,)
+
+            # --- Boltzmann weights ---
+            # z-score normalize objectives for scale-invariance
+            mu = multi_objs_t.mean()
+            sigma = multi_objs_t.std()
+            if sigma > 1e-8:
+                energy = (multi_objs_t - mu) / sigma
+            else:
+                energy = torch.zeros_like(multi_objs_t)
+            boltzmann_w = F.softmax(-energy / self.temperature, dim=0)  # (K,)
+
+            # --- Boltzmann soft target ---
+            sol_values = (boltzmann_w.unsqueeze(1) * multi_sols_t).sum(0)  # (n_vars,)
+
+            # best solution (for accuracy metrics)
+            best_sol_values = multi_sols_t[0].clone()
+            obj_val = torch.tensor(float(multi_objs_t[0]), dtype=torch.float32)
+
+        elif solution.get('sol_vals') is not None:
+            # Fallback: single solution (old format)
+            sol_dict = solution['sol_vals']
+            sol_values = torch.zeros(n_vars, dtype=torch.float32)
+            for i, (name, val) in enumerate(sol_dict.items()):
+                if i < n_vars:
+                    sol_values[i] = float(val)
+            best_sol_values = sol_values.clone()
+            obj_val = torch.tensor(
+                float(solution['obj_val']), dtype=torch.float32)
+        else:
+            sol_values = torch.zeros(n_vars, dtype=torch.float32)
+            best_sol_values = sol_values.clone()
+            obj_val = torch.tensor(0.0, dtype=torch.float32)
+
+        graph = SolutionBipartiteNodeData(
+            constraint_features, edge_indices, edge_features,
+            variable_features, sol_values, obj_val,
+        )
+        graph.best_sol_values = best_sol_values
+        graph.num_nodes = constraint_features.shape[0] + variable_features.shape[0]
+        return graph
+
+
 class Scheduler(torch.optim.lr_scheduler.ReduceLROnPlateau):
     def __init__(self, optimizer, **kwargs):
         super().__init__(optimizer, **kwargs)

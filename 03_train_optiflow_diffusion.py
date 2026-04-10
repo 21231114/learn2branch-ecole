@@ -1,5 +1,5 @@
 """
-03_train_optiflow.py — Training script for the OptiFlow 4-step pipeline.
+03_train_optiflow_multi.py — Training with Boltzmann multi-solution supervision.
 
 Pipeline:
     Step 1: GraphInitialization   — bipartite GCN embeds variable features
@@ -7,21 +7,32 @@ Pipeline:
     Step 3: LatentTrajectoryEvolution — evolves tokens via shared Transformer
     Step 4: DeslicingDecoder      — decodes back to per-variable predictions
 
-Loss:
-    L = w_bin  * FocalBCE(Binary)
-      + w_is   * CE(Small_Int)
-      + w_il   * Huber(Large_Int)
+Boltzmann Energy-Based Loss:
+    Each instance has K feasible solutions with objectives f_1, ..., f_K.
+    Boltzmann weight:  w_k = softmax(-f̃_k / T),  f̃ = (f - μ) / σ
+    Soft target:       x̄_j = Σ_k w_k · x_{k,j}
+
+    This is equivalent to minimizing KL(π_Boltzmann ∥ p_θ):
+    the model learns a distribution biased toward better solutions,
+    while benefiting from the diversity of all K solutions.
+
+    L = w_bin  * FocalBCE(x̂_bin, x̄_bin)     # soft Boltzmann targets
+      + w_is   * CE(Small_Int, x̄_is)
+      + w_il   * Huber(Large_Int, x̄_il)
       + w_rnd  * RoundingReg(Large_Int)
-      + w_cv    * ConstraintViolation
-      + w_sharp * SharpAssignReg(Slicing)
-      + w_bal   * SliceBalanceReg(Slicing)
-      + w_div   * DiversityReg(SlicingCenters)
+      + w_cv   * ConstraintViolation
+      + w_ent  * EntropyReg(Slicing)
+      + w_div  * DiversityReg(Slicing)
 
 Usage:
-    python 03_train_optiflow.py setcover -g 0
-    python 03_train_optiflow.py setcover -g -1   # CPU
-    python 03_train_optiflow.py mknapsack --epochs 200 --batch-size 16
-    python 03_train_optiflow.py SC --data-dir /path/to/samples -g 0  # auto-split 240/60
+    # Standard (single best solution, T→0):
+    python 03_train_optiflow_multi.py SC --data-dir data/coco_samples/SC/train_50 --boltzmann-temp 0.01
+
+    # Boltzmann multi-solution (default T=1.0):
+    python 03_train_optiflow_multi.py SC --data-dir data/coco_samples/SC/train_50
+
+    # With temperature annealing (start broad, sharpen over time):
+    python 03_train_optiflow_multi.py SC --data-dir data/coco_samples/SC/train_50 --boltzmann-temp 2.0 --temp-anneal 0.01
 """
 
 import os
@@ -30,7 +41,6 @@ import argparse
 import pathlib
 import time
 import json
-import math
 import numpy as np
 
 # Pre-parse GPU flag so CUDA_VISIBLE_DEVICES is set before torch initializes CUDA
@@ -42,7 +52,7 @@ import torch
 import torch.nn.functional as F
 import torch_geometric
 
-from utilities import log, SolutionGraphDataset, Scheduler
+from utilities import log, SolutionGraphDataset, MultiSolutionGraphDataset, Scheduler
 from model.graph_init import GraphInitialization
 from model.adaptive_slicing import AdaptiveSlicing
 from model.latent_evolution import LatentTrajectoryEvolution
@@ -127,61 +137,11 @@ class OptiFlowModel(torch.nn.Module):
         return result, var_types, z_var_0, attn_weights, intermediates
 
 
-def compute_slicing_regularizers(attn_weights, var_batch=None, eps=1e-8):
-    """
-    Encourage sharp per-variable assignments while keeping the average
-    slice usage of each graph well balanced.
-
-    Both penalties are averaged per graph, so the regularization stays
-    invariant to the number of variables in a graph.
-    """
-    N, K = attn_weights.shape
-    device = attn_weights.device
-
-    if var_batch is None:
-        var_batch = torch.zeros(N, dtype=torch.long, device=device)
-
-    if N == 0:
-        zero = attn_weights.new_zeros(())
-        return zero, zero
-
-    B = int(var_batch.max().item()) + 1
-
-    # Re-normalize post-dropout attention so the regularizer always sees
-    # a valid slice-probability distribution.
-    probs = attn_weights.clamp_min(0.0)
-    row_sums = probs.sum(dim=-1, keepdim=True)
-    uniform = torch.full_like(probs, 1.0 / K)
-    probs = torch.where(row_sums > eps, probs / row_sums.clamp(min=eps), uniform)
-
-    entropy_norm = math.log(max(K, 2))
-    per_var_entropy = -(probs * (probs + eps).log()).sum(dim=-1) / entropy_norm
-
-    graph_counts = probs.new_zeros(B)
-    graph_counts.scatter_add_(0, var_batch, torch.ones_like(per_var_entropy))
-
-    graph_entropy_sum = probs.new_zeros(B)
-    graph_entropy_sum.scatter_add_(0, var_batch, per_var_entropy)
-    sharpness_reg = (graph_entropy_sum / graph_counts.clamp(min=1.0)).mean()
-
-    graph_prob_sum = probs.new_zeros(B, K)
-    graph_prob_sum.scatter_add_(0, var_batch.unsqueeze(-1).expand(-1, K), probs)
-    graph_prob_mean = graph_prob_sum / graph_counts.unsqueeze(-1).clamp(min=1.0)
-    graph_prob_mean = graph_prob_mean / graph_prob_mean.sum(dim=-1, keepdim=True).clamp(min=eps)
-
-    graph_usage_entropy = -(
-        graph_prob_mean * (graph_prob_mean + eps).log()
-    ).sum(dim=-1) / entropy_norm
-    balance_reg = graph_usage_entropy.new_tensor(1.0) - graph_usage_entropy.mean()
-
-    return sharpness_reg, balance_reg
-
-
 # ======================================================================
 # Training loop
 # ======================================================================
 
-def compute_losses(model, result, var_types, attn_weights, var_batch,
+def compute_losses(model, result, var_types, attn_weights,
                    sol_values, edge_indices, edge_features,
                    constraint_features, variable_features,
                    cv_loss_fn, config):
@@ -208,16 +168,13 @@ def compute_losses(model, result, var_types, attn_weights, var_batch,
     )
 
     # ---- Slicing regularization ----
-    loss_sharpness, loss_balance = compute_slicing_regularizers(
-        attn_weights, var_batch=var_batch,
-    )
+    loss_entropy = model.slicer.entropy_loss(attn_weights)
     loss_diversity = model.slicer.diversity_loss()
 
     # ---- Total ----
     total = (task['total']
              + config['w_cv'] * cv['penalty']
-             + config['w_sharpness'] * loss_sharpness
-             + config['w_balance'] * loss_balance
+             + config['w_entropy'] * loss_entropy
              + config['w_diversity'] * loss_diversity)
 
     return {
@@ -230,20 +187,19 @@ def compute_losses(model, result, var_types, attn_weights, var_batch,
         'cv_mean': cv['mean_viol'],
         'cv_max': cv['max_viol'],
         'cv_n_violated': cv['n_violated'],
-        'sharpness_reg': loss_sharpness,
-        'balance_reg': loss_balance,
+        'entropy_reg': loss_entropy,
         'diversity_reg': loss_diversity,
     }
 
 
-def compute_accuracy(result, sol_values, var_types):
-    """Compute per-type prediction accuracy."""
+def compute_accuracy(result, best_sol_values, var_types):
+    """Compute per-type prediction accuracy (against best solution)."""
     metrics = {}
 
     # Binary accuracy (round prob to 0/1)
     if result['mask_bin'].any():
         pred = (result['prob_bin'].squeeze(-1) > 0.5).float()
-        gt = sol_values[result['mask_bin']]
+        gt = best_sol_values[result['mask_bin']]
         metrics['acc_bin'] = (pred == gt).float().mean().item()
         metrics['n_bin'] = result['mask_bin'].sum().item()
     else:
@@ -254,7 +210,7 @@ def compute_accuracy(result, sol_values, var_types):
     if result['mask_int_small'].any():
         argmax = result['logits_int_small'].argmax(dim=-1).float()
         pred = argmax + result['int_small_offsets']
-        gt = sol_values[result['mask_int_small']]
+        gt = best_sol_values[result['mask_int_small']]
         metrics['acc_int_small'] = (pred.round() == gt.round()).float().mean().item()
         metrics['n_int_small'] = result['mask_int_small'].sum().item()
     else:
@@ -264,7 +220,7 @@ def compute_accuracy(result, sol_values, var_types):
     # Large-range int: MAE
     if result['mask_int_large'].any():
         pred = result['pred_int_large'].squeeze(-1)
-        gt = sol_values[result['mask_int_large']]
+        gt = best_sol_values[result['mask_int_large']]
         metrics['mae_int_large'] = (pred - gt).abs().mean().item()
         metrics['n_int_large'] = result['mask_int_large'].sum().item()
     else:
@@ -308,7 +264,7 @@ def train_epoch(model, loader, optimizer, cv_loss_fn, config, device):
 
         # Losses
         losses = compute_losses(
-            model, result, var_types, attn_weights, var_batch,
+            model, result, var_types, attn_weights,
             batch.sol_values, batch.edge_index, batch.edge_attr,
             batch.constraint_features, batch.variable_features,
             cv_loss_fn, config,
@@ -327,7 +283,8 @@ def train_epoch(model, loader, optimizer, cv_loss_fn, config, device):
 
         # Metrics
         with torch.no_grad():
-            acc = compute_accuracy(result, batch.sol_values, var_types)
+            best_sol = batch.best_sol_values if hasattr(batch, 'best_sol_values') else batch.sol_values
+            acc = compute_accuracy(result, best_sol, var_types)
 
         B = batch.num_graphs if hasattr(batch, 'num_graphs') else 1
         total_loss += losses['total'].item() * B
@@ -376,13 +333,15 @@ def validate(model, loader, cv_loss_fn, config, device):
         )
 
         losses = compute_losses(
-            model, result, var_types, attn_weights, var_batch,
+            model, result, var_types, attn_weights,
             batch.sol_values, batch.edge_index, batch.edge_attr,
             batch.constraint_features, batch.variable_features,
             cv_loss_fn, config,
         )
 
-        acc = compute_accuracy(result, batch.sol_values, var_types)
+        acc = compute_accuracy(result,
+                               batch.best_sol_values if hasattr(batch, 'best_sol_values') else batch.sol_values,
+                               var_types)
 
         B = batch.num_graphs if hasattr(batch, 'num_graphs') else 1
         total_loss += losses['total'].item() * B
@@ -417,8 +376,7 @@ def format_metrics(metrics, prefix=''):
     parts.append(f"il={metrics.get('loss_int_large', 0):.4f}")
     parts.append(f"rnd={metrics.get('loss_rounding', 0):.4f}")
     parts.append(f"cv={metrics.get('loss_cv_penalty', 0):.4f}")
-    parts.append(f"sharp={metrics.get('loss_sharpness_reg', 0):.4f}")
-    parts.append(f"bal={metrics.get('loss_balance_reg', 0):.4f}")
+    parts.append(f"ent={metrics.get('loss_entropy_reg', 0):.4f}")
     parts.append(f"div={metrics.get('loss_diversity_reg', 0):.4f}")
 
     # Accuracy
@@ -464,6 +422,12 @@ if __name__ == "__main__":
                         help='Number of training samples when auto-splitting (default: 240).')
     parser.add_argument('--n-valid', type=int, default=60,
                         help='Number of validation samples when auto-splitting (default: 60).')
+    parser.add_argument('--boltzmann-temp', type=float, default=1.0,
+                        help='Boltzmann temperature T for multi-solution weighting. '
+                             'T→0: only best solution; T→∞: uniform average. (default: 1.0)')
+    parser.add_argument('--temp-anneal', type=float, default=0.0,
+                        help='Per-epoch temperature decay rate. '
+                             'T(e) = T0 * exp(-rate * e). 0 = no annealing. (default: 0.0)')
     args = parser.parse_args()
 
     # ---- Device ----
@@ -533,9 +497,11 @@ if __name__ == "__main__":
 
     log(f"Train files: {len(train_files)}", logfile)
     log(f"Valid files: {len(valid_files)}", logfile)
+    log(f"Boltzmann temperature: {args.boltzmann_temp}"
+        f"{f', anneal rate: {args.temp_anneal}' if args.temp_anneal > 0 else ''}", logfile)
 
-    train_data = SolutionGraphDataset(train_files)
-    valid_data = SolutionGraphDataset(valid_files) if valid_files else None
+    train_data = MultiSolutionGraphDataset(train_files, temperature=args.boltzmann_temp)
+    valid_data = MultiSolutionGraphDataset(valid_files, temperature=args.boltzmann_temp) if valid_files else None
 
     train_loader = torch_geometric.loader.DataLoader(
         train_data, batch_size=args.batch_size, shuffle=True,
@@ -584,8 +550,7 @@ if __name__ == "__main__":
         'w_int_large': 1.0,
         'w_round': 0.1,
         'w_cv': 0.5,
-        'w_sharpness': 0.01,
-        'w_balance': 0.01,
+        'w_entropy': 0.01,
         'w_diversity': 0.01,
         'grad_clip': 1.0,
     }
@@ -608,6 +573,8 @@ if __name__ == "__main__":
             'loss_type': args.loss_type,
             'n_params': n_params,
             'loss_config': config,
+            'boltzmann_temp': args.boltzmann_temp,
+            'temp_anneal': args.temp_anneal,
         }, f, indent=2)
 
     # ---- Training loop ----
@@ -621,6 +588,14 @@ if __name__ == "__main__":
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
 
+        # Temperature annealing: T(e) = T0 * exp(-rate * e)
+        if args.temp_anneal > 0:
+            cur_temp = max(args.boltzmann_temp * np.exp(-args.temp_anneal * epoch),
+                          0.01)  # floor to avoid T=0
+            train_data.temperature = cur_temp
+            if valid_data is not None:
+                valid_data.temperature = cur_temp
+
         # Train
         train_metrics = train_epoch(
             model, train_loader, optimizer, cv_loss_fn, config, device)
@@ -631,6 +606,8 @@ if __name__ == "__main__":
 
         msg = format_metrics(train_metrics, prefix='TRAIN ')
         msg += f" | lr={lr_now:.2e} | {elapsed:.1f}s"
+        if args.temp_anneal > 0:
+            msg += f" | T={train_data.temperature:.3f}"
 
         # Gate values (evolution gate openness)
         gate_vals = model.evolver.get_gate_values()
